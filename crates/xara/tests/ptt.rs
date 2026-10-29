@@ -396,6 +396,46 @@ fn a_failed_release_is_reported_after_shutdown() {
     assert_eq!(states(&rec), [true, false, false, false]);
 }
 
+struct Recovers(Rec, usize);
+
+impl Ptt for Recovers {
+    fn set(&mut self, on: bool) -> io::Result<()> {
+        self.0.set(on)?;
+        match on {
+            true => Err(io::Error::other("link dropped")),
+            false if self.1 > 0 => {
+                self.1 -= 1;
+                Err(io::Error::other("link dropped"))
+            }
+            false => Ok(()),
+        }
+    }
+
+    fn describe(&self) -> String {
+        "recovers".into()
+    }
+
+    fn release_window(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+}
+
+#[test]
+fn release_keeps_retrying_through_a_link_dropout() {
+    let rec = Rec::default();
+    let mut c = PttCtl::spawn_with(Box::new(Recovers(rec.clone(), 5)), T, Arc::default(), |_| {});
+    let t0 = Instant::now();
+    let e = loop {
+        if let Err(e) = c.set(true) {
+            break e;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(e.to_string().contains("PTT recovers failed: link dropped; released"), "{e}");
+    assert_eq!(states(&rec), [true, false, false, false, false, false, false]);
+}
+
 fn blocked_log(t: PttTiming, on: &'static str) -> (PttCtl, Rec, std::sync::mpsc::Sender<()>) {
     let rec = Rec::default();
     let (unblock, wait) = std::sync::mpsc::channel::<()>();

@@ -3,6 +3,7 @@
 ## unreleased
 
 - builds and runs on FreeBSD (xara and xara-monitor)
+- bugfix: rigctld PTT keeps retrying the unkey for 20 s when the CAT link drops
 
 ## 0.1.2
 

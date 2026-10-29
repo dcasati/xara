@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 pub trait Ptt: Send {
     fn set(&mut self, on: bool) -> io::Result<()>;
     fn describe(&self) -> String;
+    /// How long to keep retrying an unkey that failed three times in a row.
+    fn release_window(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,6 +241,12 @@ impl Ptt for Rigctld {
     fn describe(&self) -> String {
         format!("rigctld at {}", self.addr)
     }
+
+    // CAT links (USB serial behind rigctld) can drop out for seconds when RF gets into the
+    // cable; the rig stays keyed until a "T 0" lands, so keep trying through a re-enumeration.
+    fn release_window(&self) -> Duration {
+        Duration::from_secs(20)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -345,11 +355,18 @@ impl Keyer {
     }
 
     fn release(&mut self) -> bool {
-        for _ in 0..3 {
+        let until = Instant::now() + self.dev.release_window();
+        for n in 1.. {
             if self.dev.set(false).is_ok() {
                 self.keyed = false;
                 mark_released(&self.released, true);
                 return true;
+            }
+            if n >= 3 {
+                if Instant::now() >= until {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
             }
         }
         false
