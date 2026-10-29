@@ -2,7 +2,7 @@
 
 use super::{NF, SYMLEN, to48};
 use crate::demap::soft_bits;
-use crate::dsp::{CHI_MIN, Hold, Track, Window, argmax, peak_mid, thin, unit};
+use crate::dsp::{CHI_MIN, Hold, Track, Window, argmax, par_map, peak_mid, thin, unit};
 use crate::eq;
 use crate::fm::code::{Codec, Phasors};
 use crate::fm::constellation::constellation;
@@ -10,7 +10,7 @@ use crate::fm::level::{Level, PILOT_PERIOD, Record, qam_pilot};
 use crate::fm::tx::symbol_map;
 use num_complex::{Complex32, Complex64};
 use rustfft::{Fft, FftPlanner};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 pub const HOP: i64 = 4;
 pub const SYM: i64 = SYMLEN / HOP;
@@ -21,6 +21,9 @@ const PP: usize = PILOT_PERIOD as usize;
 const MAX_DAT: usize = 600;
 const REFINE: i64 = 3;
 const SN_BW_HZ: f64 = 2500.0;
+const CATCH_UP: i64 = 256;
+
+static FFT: LazyLock<Arc<dyn Fft<f64>>> = LazyLock::new(|| FftPlanner::new().plan_fft_forward(NF));
 
 pub struct Stft {
     win: Window,
@@ -137,7 +140,7 @@ impl OfdmEngine {
             markers,
             data: thin(data, MAX_DAT),
             span: l.nsym() as i64 * SYMLEN,
-            fft: FftPlanner::new().plan_fft_forward(NF),
+            fft: FFT.clone(),
             search_next: None,
             hold: Hold::new(SYM / 2, SYM * (l.nsym() as i64 - 2)),
         }
@@ -170,8 +173,12 @@ impl OfdmEngine {
             return out;
         }
         let marker_min = (MK_FRAC * self.markers.len() as f64).max(6.0);
-        for j in lo..=hi {
-            let (marker_chi, data_chi) = self.terms(st, j);
+        let terms = if hi - lo >= CATCH_UP {
+            par_map(&(lo..=hi).collect::<Vec<_>>(), |&j| self.terms(st, j))
+        } else {
+            (lo..=hi).map(|j| self.terms(st, j)).collect()
+        };
+        for (j, (marker_chi, data_chi)) in (lo..=hi).zip(terms) {
             let chi = marker_chi + data_chi;
             let candidate = (marker_chi >= marker_min && chi >= CHI_MIN).then_some((chi, ()));
             if let Some((j, metric, ())) = self.hold.offer(j, candidate) {
@@ -185,11 +192,13 @@ impl OfdmEngine {
     fn cells(&self, buf: &Track<Complex64>, t: i64, rows: usize) -> Vec<Vec<Complex64>> {
         let seg = buf.get(t, t + rows as i64 * SYMLEN);
         let fb: Vec<usize> = self.l.bins().collect();
+        let mut w = vec![Complex64::default(); NF];
+        let mut scratch = vec![Complex64::default(); self.fft.get_inplace_scratch_len()];
         seg.chunks(SYMLEN as usize)
             .enumerate()
             .map(|(r, ch)| {
-                let mut w = ch[..NF].to_vec();
-                self.fft.process(&mut w);
+                w.copy_from_slice(&ch[..NF]);
+                self.fft.process_with_scratch(&mut w, &mut scratch);
                 fb.iter().zip(&self.phasors[r]).map(|(&b, &p)| w[b] * p).collect()
             })
             .collect()

@@ -72,6 +72,7 @@ pub struct Station {
 
 impl Station {
     pub fn new(cfg: Config, opts: Options) -> Self {
+        xara_phy::hf::warm(cfg.bw);
         let bw = cfg.bw;
         let mut s = Self {
             un: Unproto::new(cfg.seed),
@@ -169,7 +170,7 @@ impl Station {
         let g = ctrl::gain(Fmt::F0, d);
         let ann = frame_audio(&self.grids, &self.un.cb, Fmt::F0, p.code, 0).iter().map(|v| quantise(v * g)).collect();
         let earliest = self.c.tx.after_hold(now);
-        self.c.tx.push(ann, earliest, Vec::new(), Kind::Announce);
+        self.c.tx.push(ann, 0, earliest, Vec::new(), Kind::Announce);
         let g = self.un.modm.gain(p.level, d);
         let n = p.frames.len();
         for (k, f) in p.frames.iter().enumerate() {
@@ -177,7 +178,7 @@ impl Station {
             let x = self.un.modm.transmission(p.level, &[f], &mut |m| rnd.draw(m));
             let samples = vec![0.0; FRAGMENT_GAP].into_iter().chain(x.iter().map(|v| quantise(v * g))).collect();
             let keyed = vec![unproto_bitrate(p.level, true)];
-            self.c.tx.push(samples, now, keyed, Kind::Fragment { last: k + 1 == n });
+            self.c.tx.push(samples, 0, now, keyed, Kind::Fragment { last: k + 1 == n });
         }
     }
 
@@ -284,7 +285,7 @@ impl Station {
     fn render(&mut self, t: &Tx) -> (Vec<f64>, Vec<Report>) {
         let d = self.c.opts.drive_db;
         let mut keyed = Vec::new();
-        let (x, g) = match t {
+        let (mut x, g) = match t {
             Tx::Ctrl { code, fmt, extra } => {
                 if *code == BREAK {
                     let r = self.tx_rnd.rand_int(2);
@@ -301,12 +302,13 @@ impl Station {
                 (self.modm.transmission(*level, &refs, &mut |m| rnd.draw(m)), self.modm.gain(*level, d))
             }
             Tx::CwId { call, blanks } => {
-                let lead = if *blanks == 0 { vec![0.0; cwid::UNIT] } else { Vec::new() };
-                let x = lead.into_iter().chain(cwid::synth(call, *blanks, false)).collect();
+                let mut x = if *blanks == 0 { vec![0.0; cwid::UNIT] } else { Vec::new() };
+                x.extend(cwid::synth(call, *blanks, false));
                 (x, 10f64.powf((d - CWID_BACKOFF_DB) / 20.0))
             }
         };
-        (x.iter().map(|v| quantise(v * g)).collect(), keyed)
+        x.iter_mut().for_each(|v| *v = quantise(*v * g));
+        (x, keyed)
     }
 
     fn bitrate(&self, level: Record, tx: bool) -> Report {
@@ -413,7 +415,7 @@ impl Modem for Station {
                 self.c.reports.push_back(Report::UnencryptedLink);
             }
             let (samples, keyed) = self.render(&t);
-            self.c.tx.push(samples, earliest, keyed, Kind::Session);
+            self.c.tx.push(samples, 0, earliest, keyed, Kind::Session);
         }
     }
 

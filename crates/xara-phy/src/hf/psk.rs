@@ -1,5 +1,6 @@
 use crate::constellation::{constellation, take_bits};
 use crate::dat::marker_map;
+use crate::dsp::par_map;
 use crate::hf::level::{Level, Pulse, Waveform};
 use num_complex::Complex64;
 use std::f32::consts::TAU;
@@ -108,10 +109,20 @@ fn carrier_audio(symbols: &[Complex64], fc: u32, delay: usize, hp: &[f64], hi: &
     let len3 = symbols.len() * SPS + delay;
     let mut y3 = scatter(symbols, SPS, delay, hp);
     y3.resize(len3 + hp.len() - 1, Complex64::default());
-    let mut y = scatter(&y3, 16, 0, hi);
-    y.resize(y3.len() * 16 + hi.len() - 1, Complex64::default());
-    let ph = nco_phase(fc, y.len());
-    y.iter().zip(ph).map(|(v, p)| v.re * f64::from(p).cos() - v.im * f64::from(p).sin()).collect()
+    let n = y3.len() * 16 + hi.len() - 1;
+    nco_phase(fc, n)
+        .into_iter()
+        .enumerate()
+        .map(|(t, p)| {
+            let mut v = Complex64::default();
+            for i in (t + 1).saturating_sub(hi.len()).div_ceil(16)..=(t / 16).min(y3.len() - 1) {
+                if y3[i] != Complex64::default() {
+                    v += y3[i] * hi[t - 16 * i];
+                }
+            }
+            v.re * f64::from(p).cos() - v.im * f64::from(p).sin()
+        })
+        .collect()
 }
 
 pub fn symbol_map(l: &Level, other: &[u16]) -> Vec<Vec<bool>> {
@@ -136,21 +147,27 @@ pub fn modulate(
     let lead: Vec<Vec<Complex64>> =
         (0..l.lead_in()).map(|_| (0..nc).map(|_| cst[rand(m) as usize]).collect()).collect();
     let mut ptrs = vec![0usize; txs.len()];
-    let mut total: Vec<f64> = Vec::new();
-    for (c, &fc) in carriers_hz.iter().enumerate() {
-        let mut x: Vec<Complex64> = lead.iter().enumerate().map(|(k, v)| v[c] * phasors[c][k].conj() * SCALE).collect();
-        for ((tx, ptr), d0) in txs.iter().zip(ptrs.iter_mut()).zip(&refs) {
-            let mut d = d0[c];
-            x.push(d * phasors[c][0].conj() * SCALE);
-            for s in 1..nsym {
-                if !(s >= 2 && map[c][s - 2]) {
-                    d *= cst[take_bits(tx, ptr, l.bps)];
+    let xs: Vec<(usize, Vec<Complex64>)> = (0..nc)
+        .map(|c| {
+            let mut x: Vec<Complex64> =
+                lead.iter().enumerate().map(|(k, v)| v[c] * phasors[c][k].conj() * SCALE).collect();
+            for ((tx, ptr), d0) in txs.iter().zip(ptrs.iter_mut()).zip(&refs) {
+                let mut d = d0[c];
+                x.push(d * phasors[c][0].conj() * SCALE);
+                for s in 1..nsym {
+                    if !(s >= 2 && map[c][s - 2]) {
+                        d *= cst[take_bits(tx, ptr, l.bps)];
+                    }
+                    x.push(d * phasors[c][s].conj() * SCALE);
                 }
-                x.push(d * phasors[c][s].conj() * SCALE);
             }
-        }
-        x.push(Complex64::default());
-        let sig = carrier_audio(&x, fc, stagger(c, nc), &hp, &hi);
+            x.push(Complex64::default());
+            (c, x)
+        })
+        .collect();
+    let sigs = par_map(&xs, |(c, x)| carrier_audio(x, carriers_hz[*c], stagger(*c, nc), &hp, &hi));
+    let mut total: Vec<f64> = Vec::new();
+    for sig in sigs {
         if sig.len() > total.len() {
             total.resize(sig.len(), 0.0);
         }

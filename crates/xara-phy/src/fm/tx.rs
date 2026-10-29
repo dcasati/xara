@@ -52,7 +52,7 @@ pub fn pre_signal_rows() -> Vec<Row> {
 }
 
 pub fn synth(rows: &[Row], scale: f64) -> Vec<f64> {
-    ofdm::synth(rows.iter().map(|row| ofdm::idft(0, row).iter().map(|v| v * scale).collect()))
+    ofdm::synth(0, rows.iter().map(|row| &row[..]), scale)
 }
 
 pub fn tune_block(drive_db: f64) -> Vec<f64> {
@@ -114,7 +114,9 @@ impl Modulator {
         rows.extend(lead_rows(&l, lead, rand));
         rows.extend(self.rows(record, key, frames));
         let g = l.gain(opt.drive_db) / f64::from(l.amp_norm);
-        synth(&rows, g).into_iter().map(|v| v.clamp(-1.0, 1.0)).collect()
+        let mut x = synth(&rows, g);
+        x.iter_mut().for_each(|v| *v = v.clamp(-1.0, 1.0));
+        x
     }
 }
 

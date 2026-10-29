@@ -134,6 +134,12 @@ impl Client {
     }
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 pub fn is_reply(l: &str) -> bool {
     l == "OK" || l == "WRONG" || ["VERSION ", "TUNE ", "CLEANTXBUFFER "].iter().any(|p| l.starts_with(p))
 }

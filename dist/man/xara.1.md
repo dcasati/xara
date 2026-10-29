@@ -2,7 +2,7 @@
 title: XARA
 section: 1
 header: User Commands
-date: 2026-10-24
+date: 2026-10-29
 ---
 
 # NAME
@@ -47,6 +47,13 @@ along with KISS for applications such as Pat. See the README for full details.
 :   Pulse sink or ALSA PCM to transmit into (required). Without **--radio**, it must be
     a Pulse null sink or the ALSA **null** PCM.
 
+**--tx-buffer-ms** *N*
+
+:   Transmit audio queued ahead of the sound card, in ms. 30-500 (default 40).
+    Raise it if xara logs playback underruns: try 80, then 160. xara times its
+    transmissions around the extra delay, but keep it as low as runs without
+    underruns.
+
 **--call** *CALL*
 
 :   Initial MYCALL (required; N0CALL is refused).
@@ -87,9 +94,12 @@ along with KISS for applications such as Pat. See the README for full details.
 
 :   TX drive in dB, at most 0 (default -5).
 
+**--log** *FILE*
+:   Append UTC-timestamped output to *FILE*.
+
 **--quiet**
 
-:   No trace output.
+:   No trace output. Lines are still logged when using **--log**.
 
 **--ui-port** *N*
 

@@ -141,3 +141,27 @@ fn ptt_lead_is_absorbed() {
         assert!(after.top_tx(0) >= 10 && after.secs() < 100.0, "lead {ms:?}: {:.1} s\n{}", after.secs(), after.trace());
     }
 }
+
+#[test]
+fn ssid_calls_link_over_audio() {
+    let cfg = |call: &str, seed| Config { seed, ..Config::new(Bandwidth::Hz500, call) };
+    let mut air = Air::pair(
+        [Station::new(cfg("N0CALL-1", 3), Options::default()), Station::new(cfg("N1CALL-T", 5), Options::default())],
+        [2400, 2400],
+        0.002,
+        |r| matches!(r, Report::Host(HostEvent::Buffer(_) | HostEvent::Sn(_))),
+    );
+    air.st[0].connect("N0CALL-1", "N1CALL-T", &[]);
+    let line = Report::Host(HostEvent::Connected {
+        caller: "N0CALL-1".into(),
+        answerer: "N1CALL-T".into(),
+        vias: Vec::new(),
+        bw: Bandwidth::Hz500.into(),
+    });
+    assert!(air.run_until(40.0, |a| a.has(0, &line) && a.has(1, &line)), "{}", air.trace());
+    let (pa, pb) = (payload(300, 77), payload(100, 78));
+    air.st[0].send(&pa);
+    air.st[1].send(&pb);
+    assert!(air.run_until(90.0, |a| a.got[1].len() >= pa.len() && a.got[0].len() >= pb.len()), "{}", air.trace());
+    assert_eq!((&air.got[1], &air.got[0]), (&pa, &pb));
+}

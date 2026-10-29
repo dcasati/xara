@@ -6,13 +6,13 @@ use std::marker::PhantomData;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use super::{Audio, BLOCK, DeviceList, RATE, STALL, capture_only, quantize, remaining, sample};
+use super::ratematch::{self, Queue, TxBuffer};
+use super::{Audio, BLOCK, DeviceList, IO_TIMEOUT, RATE, capture_only, quantize, remaining, sample};
 
 type Frames = sys::snd_pcm_uframes_t;
 
 const PERIOD: Frames = BLOCK as Frames;
-const CAPTURE_BUFFER: Frames = 20 * PERIOD;
-const PLAYBACK_BUFFER: Frames = 4 * PERIOD;
+const CAPTURE_BUFFER: Frames = RATE as Frames;
 const PLAYBACK_START: Frames = 2 * PERIOD;
 const DEPTH: usize = 16;
 const WALK_DEPTH: usize = 64;
@@ -446,6 +446,19 @@ impl Handle {
         check("snd_pcm_wait", unsafe { sys::snd_pcm_wait(self.0, ms) }).map(drop)
     }
 
+    fn buffer_at_least(&self, hw: &Owned<sys::snd_pcm_hw_params_t>, val: &mut Frames) -> Result<(), Error> {
+        let mut min = *val;
+        // SAFETY: self.0 is open until Drop, hw is a live hw_params block, and a failed set_min leaves hw unchanged.
+        unsafe {
+            sys::snd_pcm_hw_params_set_buffer_size_min(self.0, hw.0, &mut min);
+            check(
+                "snd_pcm_hw_params_set_buffer_size_near",
+                sys::snd_pcm_hw_params_set_buffer_size_near(self.0, hw.0, val),
+            )
+            .map(drop)
+        }
+    }
+
     fn card(&self) -> Result<i32, Error> {
         let info = Owned::new("snd_pcm_info_malloc", sys::snd_pcm_info_malloc, sys::snd_pcm_info_free)?;
         // SAFETY: self.0 is open until Drop and info is a live info block.
@@ -464,6 +477,18 @@ impl Handle {
         // SAFETY: self.0 is open and buf has room for buf.len() / frame whole frames.
         let n = unsafe { sys::snd_pcm_readi(self.0, buf.as_mut_ptr().cast(), (buf.len() / frame) as Frames) };
         check("snd_pcm_readi", n).map(|n| n as usize)
+    }
+
+    fn avail(&self) -> Result<usize, Error> {
+        // SAFETY: self.0 is open until Drop.
+        check("snd_pcm_avail", unsafe { sys::snd_pcm_avail(self.0) }).map(|n| n as usize)
+    }
+
+    fn delay(&self) -> Result<usize, Error> {
+        let mut n: sys::snd_pcm_sframes_t = 0;
+        // SAFETY: self.0 is open until Drop and n is a valid out pointer.
+        check("snd_pcm_delay", unsafe { sys::snd_pcm_delay(self.0, &mut n) })?;
+        Ok(n.max(0) as usize)
     }
 
     fn writei(&self, buf: &[u8], frame: usize) -> Result<usize, Error> {
@@ -487,6 +512,7 @@ struct Pcm {
     format: Format,
     width: usize,
     channels: usize,
+    buffer: usize,
     buf: Vec<u8>,
     xruns: u64,
     reported: Option<Instant>,
@@ -504,6 +530,7 @@ impl Pcm {
             format: Format::FloatLE,
             width: 4,
             channels: 1,
+            buffer: 0,
             buf: Vec::new(),
             xruns: 0,
             reported: None,
@@ -514,14 +541,14 @@ impl Pcm {
         self.pcm.card().map_err(alsa_err(&self.name))
     }
 
-    fn setup(&mut self) -> io::Result<()> {
+    fn setup(&mut self, want: Frames) -> io::Result<()> {
         let e = alsa_err(&self.name);
         let ok = |func, r: c_int| check(func, r).map_err(&e);
         let hw_params =
             || Owned::new("snd_pcm_hw_params_malloc", sys::snd_pcm_hw_params_malloc, sys::snd_pcm_hw_params_free);
         let (p, capture) = (self.pcm.0, self.dir == Direction::Capture);
         let (hw, cur) = (hw_params().map_err(&e)?, hw_params().map_err(&e)?);
-        let (mut period, mut buffer) = (PERIOD, if capture { CAPTURE_BUFFER } else { PLAYBACK_BUFFER });
+        let (mut period, mut buffer) = (PERIOD, want);
         let (mut rate, mut channels, mut dir) = (0, 1, 0);
         // SAFETY: p is an open PCM and hw is a live hw_params block.
         let found = unsafe {
@@ -557,10 +584,7 @@ impl Pcm {
                 "snd_pcm_hw_params_set_period_size_near",
                 sys::snd_pcm_hw_params_set_period_size_near(p, hw.0, &mut period, &mut dir),
             )?;
-            ok(
-                "snd_pcm_hw_params_set_buffer_size_near",
-                sys::snd_pcm_hw_params_set_buffer_size_near(p, hw.0, &mut buffer),
-            )?;
+            self.pcm.buffer_at_least(&hw, &mut buffer).map_err(&e)?;
             ok("snd_pcm_hw_params", sys::snd_pcm_hw_params(p, hw.0))?;
             ok("snd_pcm_hw_params_current", sys::snd_pcm_hw_params_current(p, cur.0))?;
             ok("snd_pcm_hw_params_get_rate", sys::snd_pcm_hw_params_get_rate(cur.0, &mut rate, &mut dir))?;
@@ -598,6 +622,7 @@ impl Pcm {
             self.name,
         );
         self.format = format;
+        self.buffer = buffer as usize;
         self.width = if format == Format::S16LE { 2 } else { 4 };
         self.channels = channels as usize;
         Ok(())
@@ -625,7 +650,11 @@ impl Pcm {
         self.xruns += 1;
         if self.reported.is_none_or(|t| t.elapsed() >= REPORT) {
             self.reported = Some(Instant::now());
-            let kind = if err.errno == libc::ESTRPIPE { "suspended" } else { "xrun" };
+            let kind = match (err.errno, self.dir) {
+                (libc::ESTRPIPE, _) => "suspended",
+                (_, Direction::Playback) => "underrun",
+                _ => "overrun",
+            };
             say!("alsa {} {:?}: {kind}, recovered ({} so far)", what(self.dir), self.name, self.xruns);
         }
         Ok(())
@@ -662,13 +691,32 @@ fn get(f: &[u8], format: Format) -> i16 {
     }
 }
 
+fn short_buffer(name: &str, granted: usize, tx: TxBuffer) -> Option<String> {
+    if granted >= tx.capacity() {
+        return None;
+    }
+    let ms = |frames: usize| frames * 1000 / RATE as usize;
+    let fits = granted / TxBuffer::ms(1).capacity();
+    let advice = if fits >= ratematch::MIN_MS as usize {
+        format!("use --tx-buffer-ms {fits} or less")
+    } else {
+        format!("even --tx-buffer-ms {} needs {} ms", ratematch::MIN_MS, ms(TxBuffer::ms(ratematch::MIN_MS).capacity()))
+    };
+    Some(format!(
+        "ALSA playback {name:?}: the device buffers at most {} ms, but --tx-buffer-ms {} needs {} ms (4x); {advice}",
+        ms(granted),
+        ms(tx.target),
+        ms(tx.capacity())
+    ))
+}
+
 pub struct AlsaIo {
     rec: Pcm,
     play: Option<Pcm>,
 }
 
 impl AlsaIo {
-    pub fn open(capture: &str, playback: &str, radio: bool) -> io::Result<Self> {
+    pub fn open(capture: &str, playback: &str, radio: bool, tx: TxBuffer) -> io::Result<Self> {
         let cfg = Config::load()?;
         let route = cfg.resolve_playback(playback, radio)?;
         let mut play = Pcm::open(&cfg, playback, Direction::Playback)?;
@@ -679,14 +727,17 @@ impl AlsaIo {
             )));
         }
         let mut rec = Pcm::open(&cfg, capture, Direction::Capture)?;
-        play.setup()?;
-        rec.setup()?;
+        play.setup(tx.capacity() as Frames)?;
+        if let Some(e) = short_buffer(playback, play.buffer, tx) {
+            return Err(io::Error::other(e));
+        }
+        rec.setup(CAPTURE_BUFFER)?;
         Ok(Self { rec, play: Some(play) })
     }
 
     pub fn open_capture(capture: &str) -> io::Result<Self> {
         let mut rec = Pcm::open(&Config::load()?, capture, Direction::Capture)?;
-        rec.setup()?;
+        rec.setup(CAPTURE_BUFFER)?;
         Ok(Self { rec, play: None })
     }
 }
@@ -697,7 +748,7 @@ impl Audio for AlsaIo {
         let frame = r.frame();
         let need = x.len() * frame;
         r.buf.resize(need, 0);
-        let (mut got, until) = (0, Instant::now() + STALL);
+        let (mut got, until) = (0, Instant::now() + IO_TIMEOUT);
         while got < need {
             let n = r.pcm.readi(&mut r.buf[got..], frame);
             match n {
@@ -722,7 +773,7 @@ impl Audio for AlsaIo {
             }
         }
         let frame = p.frame();
-        let (mut off, until) = (0, Instant::now() + STALL);
+        let (mut off, until) = (0, Instant::now() + IO_TIMEOUT);
         while off < p.buf.len() {
             let n = p.pcm.writei(&p.buf[off..], frame);
             match n {
@@ -733,6 +784,19 @@ impl Audio for AlsaIo {
             }
         }
         Ok(())
+    }
+
+    fn queued(&mut self) -> io::Result<Option<Queue>> {
+        let Some(p) = &mut self.play else { return Err(capture_only()) };
+        let frames = match p.pcm.delay() {
+            Ok(n) => n,
+            Err(e) => p.recover(e).map(|()| 0)?,
+        };
+        Ok(Some(Queue { frames, floor: 0, underruns: p.xruns }))
+    }
+
+    fn backlog(&mut self) -> io::Result<Option<usize>> {
+        Ok(self.rec.pcm.avail().ok())
     }
 }
 
@@ -849,6 +913,61 @@ mod tests {
             let e = check(n, true).unwrap_err();
             assert!(e.contains(why), "{n}: {e}");
         }
+    }
+
+    #[test]
+    fn a_playback_buffer_smaller_than_the_tx_capacity_is_refused() {
+        let tx = TxBuffer::ms(500);
+        assert_eq!(short_buffer("dmix:CARD=Device", 96000, tx), None);
+        assert_eq!(short_buffer("dmix:CARD=Device", 100000, tx), None);
+        assert_eq!(
+            short_buffer("dmix:CARD=Device", 16384, tx).as_deref(),
+            Some(
+                "ALSA playback \"dmix:CARD=Device\": the device buffers at most 341 ms, but --tx-buffer-ms 500 needs \
+                 2000 ms (4x); use --tx-buffer-ms 85 or less"
+            )
+        );
+        assert_eq!(short_buffer("hw:1,0", 7680, TxBuffer::ms(40)), None);
+        assert!(
+            short_buffer("hw:1,0", 7679, TxBuffer::ms(40)).is_some_and(|e| e.ends_with("--tx-buffer-ms 39 or less"))
+        );
+        assert!(short_buffer("hw:1,0", 4096, TxBuffer::ms(40)).is_some_and(|e| {
+            e.ends_with("at most 85 ms, but --tx-buffer-ms 40 needs 160 ms (4x); even --tx-buffer-ms 30 needs 120 ms")
+        }));
+    }
+
+    #[test]
+    fn the_playback_buffer_rounds_up_to_whole_periods_unless_the_device_max_is_lower() {
+        let pcm = Handle::open(c"null", Direction::Playback).unwrap();
+        let setup = |max: Option<Frames>| {
+            let hw = Owned::new("snd_pcm_hw_params_malloc", sys::snd_pcm_hw_params_malloc, sys::snd_pcm_hw_params_free)
+                .unwrap();
+            let (mut period, mut channels, mut dir) = (PERIOD, 1, 0);
+            // SAFETY: pcm is open and hw is a live hw_params block.
+            unsafe {
+                assert!(sys::snd_pcm_hw_params_any(pcm.0, hw.0) >= 0);
+                assert!(sys::snd_pcm_hw_params_set_access(pcm.0, hw.0, sys::SND_PCM_ACCESS_RW_INTERLEAVED) >= 0);
+                assert!(sys::snd_pcm_hw_params_set_format(pcm.0, hw.0, Format::S16LE.code()) >= 0);
+                assert!(sys::snd_pcm_hw_params_set_channels_near(pcm.0, hw.0, &mut channels) >= 0);
+                assert!(sys::snd_pcm_hw_params_set_rate(pcm.0, hw.0, RATE, 0) >= 0);
+                assert!(sys::snd_pcm_hw_params_set_period_size_near(pcm.0, hw.0, &mut period, &mut dir) >= 0);
+                assert!(sys::snd_pcm_hw_params_set_periods_integer(pcm.0, hw.0) >= 0);
+                if let Some(mut max) = max {
+                    assert!(sys::snd_pcm_hw_params_set_buffer_size_max(pcm.0, hw.0, &mut max) >= 0);
+                }
+            }
+            assert_eq!(period, PERIOD);
+            hw
+        };
+        let tx = TxBuffer::ms(33);
+        let mut buffer = tx.capacity() as Frames;
+        pcm.buffer_at_least(&setup(None), &mut buffer).unwrap();
+        assert_eq!(buffer, 14 * PERIOD);
+        assert_eq!(short_buffer("null", buffer as usize, tx), None);
+        let mut buffer = tx.capacity() as Frames;
+        pcm.buffer_at_least(&setup(Some(4000)), &mut buffer).unwrap();
+        assert_eq!(buffer, 8 * PERIOD);
+        assert!(short_buffer("null", buffer as usize, tx).is_some_and(|e| e.contains("at most 80 ms")));
     }
 
     #[test]

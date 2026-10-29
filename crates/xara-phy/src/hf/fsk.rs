@@ -1,7 +1,7 @@
 use crate::constellation::take_bits;
+use crate::dsp::sine;
 use crate::hf::level::{FSK_PILOTS, Level, Waveform};
 use crate::ofdm::fall;
-use std::f64::consts::PI;
 
 pub const GRAY: [u32; 16] = [0, 1, 3, 2, 7, 6, 4, 5, 15, 14, 12, 13, 8, 9, 11, 10];
 
@@ -51,10 +51,7 @@ pub fn modulate(l: &Level, other: &[u16], txs: &[Vec<u8>], rand: &mut dyn FnMut(
         bins.extend(rows(l, other, tx));
     }
     let nsamp = 16 * g.sps as usize;
-    let mut x: Vec<f64> = bins
-        .iter()
-        .flat_map(|&k| (0..nsamp).map(move |n| 2.0 * (2.0 * PI * f64::from(k) * n as f64 / nsamp as f64).sin()))
-        .collect();
+    let mut x: Vec<f64> = bins.iter().flat_map(|&k| sine(k, nsamp)[..nsamp].iter().map(|&s| 2.0 * s)).collect();
     if let Some(tail) = x.len().checked_sub(nsamp / 32) {
         for (v, f) in x[tail..].iter_mut().zip(fall(nsamp / 32)) {
             *v *= f;

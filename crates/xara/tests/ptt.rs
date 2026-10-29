@@ -576,6 +576,9 @@ fn bad_option_values_are_refused() {
         (&["--hf", "1000"], "bad bandwidth 1000"),
         (&["--hf", "500", "--fm", "narrow"], "--hf and --fm cannot both be given"),
         (&["--fm", "wide", "--hf", "2300"], "--hf and --fm cannot both be given"),
+        (&["--tx-buffer-ms", "29"], "--tx-buffer-ms must be 30..500"),
+        (&["--tx-buffer-ms", "501"], "--tx-buffer-ms must be 30..500"),
+        (&["--tx-buffer-ms", "-5"], "--tx-buffer-ms: invalid digit"),
     ] {
         let (c, e) = run(extra);
         assert_eq!(c, 2, "{extra:?}: {e}");

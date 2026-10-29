@@ -1,4 +1,4 @@
-use std::f64::consts::PI;
+use crate::dsp::sine;
 
 pub const UNIT: usize = 2048;
 
@@ -59,15 +59,13 @@ pub fn units(text: &str) -> Vec<bool> {
 
 pub fn synth(call: &str, blanks: u32, ra_board: bool) -> Vec<f64> {
     let text = " ".repeat(blanks as usize) + call;
-    let tone = |k: f64, a: f64| (1..=UNIT).map(move |n| a * (2.0 * PI * k * n as f64 / UNIT as f64).sin());
+    let tone = |k: u32, a: f64| sine(k, UNIT)[1..].iter().map(move |&s| a * s);
     let mut keyed = false;
     let mut out = Vec::new();
     for u in units(&text) {
         keyed |= u;
         let lo = keyed && !ra_board;
-        out.extend(
-            tone(64.0, if u { 1.6 } else { 0.0 }).zip(tone(32.0, if lo { 0.8 } else { 0.0 })).map(|(a, b)| a + b),
-        );
+        out.extend(tone(64, if u { 1.6 } else { 0.0 }).zip(tone(32, if lo { 0.8 } else { 0.0 })).map(|(a, b)| a + b));
     }
     out
 }

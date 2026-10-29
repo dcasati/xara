@@ -1,6 +1,7 @@
 use crate::fm::adapt::{decode_allow, frame_ticks};
 use crate::num::rint;
 use crate::time::{SECOND, Time};
+use std::collections::VecDeque;
 use xara_phy::fm::level::{FmBandwidth, RECORDS, Record};
 
 pub const TICK: Time = 128;
@@ -18,6 +19,10 @@ const SYNC_SLACK: f64 = 520.0;
 const ACTIVE_SCAN_SLACK: f64 = 60.0;
 const BACKOFF: [f64; 3] = [846.5, 1499.5, 2152.5];
 const WATCHDOG_MS: [i64; 3] = [16_400, 22_400, 31_400];
+// deviates from VARA behavior
+const RECENT: usize = 8;
+const MISS_TICKS: i64 = 38;
+const MISS_LIMIT: i64 = 4;
 
 pub fn watchdog(vias: usize) -> Time {
     WATCHDOG_MS[vias.min(2)] * SECOND / 1000
@@ -52,19 +57,32 @@ pub fn receiver_sync_window(bw: FmBandwidth, record: Record, vias: usize, two: b
     (lo, hi)
 }
 
+#[derive(Clone, Debug, Default)]
+struct Recent(VecDeque<i64>);
+
+impl Recent {
+    fn push(&mut self, ticks: i64) -> i64 {
+        if self.0.len() == RECENT {
+            self.0.pop_front();
+        }
+        self.0.push_back(ticks);
+        rint(self.0.iter().sum::<i64>() as f64 / self.0.len() as f64)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Timing {
     bw: FmBandwidth,
     vias: usize,
     pub count: [i64; RECORDS],
-    pub sum: [i64; RECORDS],
+    recent: [Recent; RECORDS],
     pub mean: [i64; RECORDS],
     pub window: [i64; RECORDS],
     pub ctrl_n: i64,
-    ctrl_sum: i64,
-    ctrl_first: i64,
+    ctrl_recent: Recent,
     pub ctrl_mean: i64,
     ctrl_win: i64,
+    misses: i64,
 }
 
 impl Timing {
@@ -73,14 +91,14 @@ impl Timing {
             bw,
             vias: vias.min(2),
             count: [0; RECORDS],
-            sum: [0; RECORDS],
+            recent: Default::default(),
             mean: [0; RECORDS],
             window: [0; RECORDS],
             ctrl_n: 0,
-            ctrl_sum: 0,
-            ctrl_first: 0,
+            ctrl_recent: Recent::default(),
             ctrl_mean: 0,
             ctrl_win: 0,
+            misses: 0,
         }
     }
 
@@ -92,8 +110,8 @@ impl Timing {
         let (bw, v, i) = (self.bw, self.vias, record.index());
         let ticks = if record == Record::Connect && v > 0 { rint(ticks as f64 + 40.0 * v as f64) } else { ticks };
         self.count[i] += 1;
-        self.sum[i] += ticks;
-        self.mean[i] = rint(self.sum[i] as f64 / self.count[i] as f64);
+        self.mean[i] = self.recent[i].push(ticks);
+        self.misses = 0;
         let base = record.data_level().map_or(0, |l| l.get());
         for l in bw.levels().skip(base) {
             if self.count[l.get()] != 0 {
@@ -125,13 +143,8 @@ impl Timing {
     pub fn ctrl(&mut self, ticks: i64) {
         let (bw, v) = (self.bw, self.vias);
         self.ctrl_n += 1;
-        self.ctrl_sum += ticks;
-        if self.ctrl_n == 1 {
-            self.ctrl_first = ticks;
-            self.ctrl_mean = self.ctrl_sum;
-        } else {
-            self.ctrl_mean = rint((self.ctrl_sum - self.ctrl_first) as f64 / (self.ctrl_n - 1) as f64);
-        }
+        self.ctrl_mean = if self.ctrl_n == 1 { ticks } else { self.ctrl_recent.push(ticks) };
+        self.misses = 0;
         self.ctrl_win = if v == 0 { self.ctrl_mean + 75 } else { rint(self.ctrl_mean as f64 + VIA_CTRL_ADD[v]) };
         if self.ctrl_n != 1 {
             return;
@@ -152,14 +165,67 @@ impl Timing {
         }
     }
 
+    pub fn miss(&mut self) {
+        self.misses = (self.misses + 1).min(MISS_LIMIT);
+    }
+
     pub fn data_window(&self, record: Record) -> i64 {
-        match self.window[record.index()] {
+        let w = match self.window[record.index()] {
             0 => self.ack_window(decode_allow(self.bw, record.level().map_or(record, Record::Data)) + 300),
             w => w,
-        }
+        };
+        w + self.misses * MISS_TICKS
     }
 
     pub fn ctrl_window(&self) -> i64 {
-        if self.ctrl_win == 0 { 500 } else { self.ctrl_win }
+        (if self.ctrl_win == 0 { 500 } else { self.ctrl_win }) + self.misses * MISS_TICKS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exchange(t: &mut Timing, reply: i64) -> bool {
+        let ok = reply <= t.ctrl_window();
+        if ok {
+            t.ctrl(reply);
+        } else {
+            t.miss();
+        }
+        ok
+    }
+
+    #[test]
+    fn drifting_control_replies_stay_inside_the_window() {
+        let mut t = Timing::new(FmBandwidth::Wide, 0);
+        t.ctrl(372);
+        let missed = (0..200).filter(|&k| !exchange(&mut t, 166 + 8 * k)).count();
+        assert!(missed <= 2, "{missed}");
+    }
+
+    #[test]
+    fn a_window_left_behind_widens_until_it_catches_up() {
+        let mut t = Timing::new(FmBandwidth::Wide, 0);
+        t.ctrl(372);
+        (0..20).for_each(|_| t.ctrl(200));
+        let tries = (0..10).position(|_| exchange(&mut t, 400)).unwrap();
+        assert_eq!(tries, 4);
+        let ok: Vec<bool> = (0..30).map(|_| exchange(&mut t, 400)).collect();
+        assert!(ok[15..].iter().all(|&o| o), "{ok:?}");
+    }
+
+    #[test]
+    fn a_measured_reply_clears_the_misses() {
+        let mut t = Timing::new(FmBandwidth::Wide, 0);
+        t.ctrl(372);
+        t.ctrl(200);
+        let base = t.ctrl_window();
+        t.miss();
+        t.miss();
+        assert_eq!(t.ctrl_window(), base + 2 * MISS_TICKS);
+        assert_eq!(t.data_window(Record::Start), t.window[Record::Start.index()] + 2 * MISS_TICKS);
+        t.ctrl(200);
+        assert_eq!(t.ctrl_window(), base);
     }
 }

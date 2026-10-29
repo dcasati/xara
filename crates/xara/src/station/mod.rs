@@ -181,6 +181,12 @@ pub trait Modem {
         c.tx.retune(|| Self::tune_tone(db));
     }
 
+    fn set_tx_latency(&mut self, t: Time) {
+        let c = self.common_mut();
+        c.opts.tx_latency = t;
+        c.tx.set_latency(t);
+    }
+
     fn options(&self) -> &Options {
         &self.common().opts
     }

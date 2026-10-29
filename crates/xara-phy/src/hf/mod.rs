@@ -35,6 +35,13 @@ pub fn whitening() -> &'static [u8] {
     &WHITE
 }
 
+pub fn warm(bw: Bandwidth) {
+    tables(bw);
+    whitening();
+    psk_phasors();
+    ofdm_phasors();
+}
+
 pub fn psk_phasors() -> &'static [Vec<Complex64>] {
     &PSK_PHASORS
 }

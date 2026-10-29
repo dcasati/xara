@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- `--log` produces timestamped log files
+- new audio resampling and buffering path
+- bugfix: call signs with SSID are encoded properly
+
 ## 0.1.1
 
 recording feature and bugfixes

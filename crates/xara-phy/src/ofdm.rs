@@ -17,25 +17,22 @@ pub fn fall(n: usize) -> Vec<f64> {
 
 static IFFT: LazyLock<Arc<dyn Fft<f64>>> = LazyLock::new(|| FftPlanner::new().plan_fft_inverse(NFFT));
 
-pub(crate) fn idft(first: usize, row: &[Complex64]) -> Vec<f64> {
-    let mut buf = vec![Complex64::default(); NFFT];
-    buf[first..first + row.len()].copy_from_slice(row);
-    IFFT.process(&mut buf);
-    buf.iter().map(|z| 2.0 * z.re).collect()
-}
-
-pub(crate) fn synth(blocks: impl ExactSizeIterator<Item = Vec<f64>>) -> Vec<f64> {
+pub(crate) fn synth<'a>(first: usize, rows: impl ExactSizeIterator<Item = &'a [Complex64]>, scale: f64) -> Vec<f64> {
     let fall = fall(NWIN);
-    let mut out = Vec::with_capacity(blocks.len() * (NFFT + NCP));
+    let mut out = Vec::with_capacity(rows.len() * (NFFT + NCP));
     let mut saved = [0.0; NWIN];
-    for x in blocks {
+    let mut buf = vec![Complex64::default(); NFFT];
+    let mut scratch = vec![Complex64::default(); IFFT.get_inplace_scratch_len()];
+    for row in rows {
+        buf.fill(Complex64::default());
+        buf[first..first + row.len()].copy_from_slice(row);
+        IFFT.process_with_scratch(&mut buf, &mut scratch);
         let start = out.len();
-        out.extend_from_slice(&x[NFFT - NCP..]);
-        out.extend_from_slice(&x);
+        out.extend(buf[NFFT - NCP..].iter().chain(&buf).map(|z| 2.0 * z.re * scale));
         for k in 0..NWIN {
             out[start + k] = fall[NWIN - 1 - k] * out[start + k] + fall[k] * saved[k];
         }
-        saved.copy_from_slice(&x[..NWIN]);
+        saved.copy_from_slice(&out[start + NCP..start + NCP + NWIN]);
     }
     if let Some(tail) = out.len().checked_sub(NWIN) {
         for (v, f) in out[tail..].iter_mut().zip(&fall) {

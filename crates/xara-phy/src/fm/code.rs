@@ -30,6 +30,13 @@ pub fn whitening() -> &'static [u8] {
     &WHITE
 }
 
+pub fn warm() {
+    for bw in [FmBandwidth::Narrow, FmBandwidth::Wide] {
+        tables(bw);
+    }
+    whitening();
+}
+
 pub fn phase_indices(key: Option<u32>) -> Vec<[u8; PHASOR_ROWS]> {
     let mut r = match key {
         None => VbRnd::stream(seq::FM_SEED),

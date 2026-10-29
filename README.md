@@ -44,6 +44,7 @@ alternatively for a local setup you can do:
     --audio pulse|alsa      pulse vs alsa audio path
     --capture SOURCE        audio source
     --playback SINK         audio sink
+    --tx-buffer-ms N        TX audio queue, raise on underruns (30-500, default 40)
 
     --hf 500|2300|2750      HF mode, bandwidth setting
     --fm narrow|wide        FM mode, narrow vs wide
@@ -68,6 +69,7 @@ alternatively for a local setup you can do:
 
     --digi CALL             FM digipeat for CALL (default: off)
     --record PATH           record rx, tx and PTT to FLAC (or WAV if .wav)
+    --log FILE              append UTC-timestamped output to FILE
     --quiet                 no output
     --version and --help    guess
 
@@ -128,6 +130,7 @@ options:
     --dump                  dump entire payloads
     --verbose               report unconfirmed blind detections
     --json                  print newline-delimited JSON records
+    --log FILE              append UTC-timestamped output to FILE
     --version and --help    guess
 
 ## registered mode

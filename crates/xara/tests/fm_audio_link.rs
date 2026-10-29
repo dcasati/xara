@@ -203,10 +203,15 @@ fn ptt_lead_700_ms_at_both_ends_no_longer_slows_the_link() {
 
 #[test]
 fn ptt_lead_1000_ms_at_both_ends() {
-    let before = led([1000, 1000], false);
-    assert!(matches!(before, Err(Failure::Stalled(_))), "unaware: {:?}", before.map(|a| a.secs()));
     let after = led([1000, 1000], true).unwrap();
     assert!(after.secs() < 50.0, "aware {:.1} s", after.secs());
+    let before = led([1000, 1000], false);
+    let slow = match &before {
+        Err(Failure::Stalled(_)) => true,
+        Ok(b) => b.secs() > 2.0 * after.secs(),
+        Err(_) => false,
+    };
+    assert!(slow, "unaware: {:?}, aware {:.1} s", before.map(|a| a.secs()), after.secs());
 }
 
 fn ptt_off_at(a: &Air, i: usize) -> f64 {

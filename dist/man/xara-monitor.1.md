@@ -2,7 +2,7 @@
 title: XARA-MONITOR
 section: 1
 header: User Commands
-date: 2026-10-20
+date: 2026-10-29
 ---
 
 # NAME
@@ -56,6 +56,9 @@ timestamped details about the observed packets.
 **--key-idle** *MIN*
 
 :   Max target idle time (default: 30, 0 disables)
+
+**--log** *FILE*
+:   Append UTC-timestamped output to *FILE*.
 
 **--dump**
 

@@ -53,6 +53,9 @@
 #capture = xara_rx.monitor
 #playback = xara_tx
 
+# TX audio queue in ms, raise it if xara logs playback underruns
+#tx-buffer-ms = 40
+
 ###
 # radio and PTT
 

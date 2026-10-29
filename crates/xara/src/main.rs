@@ -2,15 +2,16 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use xara::audio::{self, Audio, Backend};
+use std::time::{Duration, Instant};
+use xara::audio::ratematch::{self, Event, RateMatch, TxBuffer};
+use xara::audio::{self, Audio, Backend, Behind};
 use xara::cli::{self, UiArgs, Usage, num};
 use xara::ptt::{PttCtl, PttSpec, PttTiming};
 use xara::record::{self, Recorder};
-use xara::say;
 use xara::signals;
 use xara::station::{self, DEFAULT_DRIVE_DB, Modem, Options};
 use xara::tnc::Tnc;
+use xara::{info, say};
 use xara_arq::{fm, hf};
 use xara_host::kiss::KissServer;
 use xara_host::server::Host;
@@ -30,6 +31,7 @@ const USAGE: Usage = Usage {
 };
 
 const SECOND_SIGNAL_GRACE: Duration = Duration::from_secs(2);
+const STATUS_EVERY: Duration = Duration::from_secs(60);
 const EXIT_RESTART_FAILED: u8 = 75;
 const TOKEN_ENV: &str = "XARA_UI_TOKEN";
 const RECORD_PART_ENV: &str = "XARA_RECORD_PART";
@@ -38,6 +40,7 @@ struct Args {
     audio: Backend,
     capture: String,
     playback: String,
+    tx_buffer_ms: u32,
     call: String,
     digi: String,
     bw: Bandwidth,
@@ -58,6 +61,7 @@ struct Args {
     ptt: Option<PttSpec>,
     timing: PttTiming,
     record: Option<PathBuf>,
+    log: Option<PathBuf>,
     hf_given: bool,
 }
 
@@ -71,6 +75,7 @@ fn defaults() -> Args {
         audio: Backend::default(),
         capture: String::new(),
         playback: String::new(),
+        tx_buffer_ms: ratematch::DEFAULT_MS,
         call: String::new(),
         digi: String::new(),
         bw: Bandwidth::Hz2300,
@@ -91,6 +96,7 @@ fn defaults() -> Args {
         ptt: None,
         timing: PttTiming::default(),
         record: None,
+        log: None,
         hf_given: false,
     }
 }
@@ -103,6 +109,7 @@ fn take(a: &mut Args, k: &str, mut v: impl FnMut() -> Result<String, String>) ->
         "--audio" => a.audio = v()?.parse()?,
         "--capture" => a.capture = v()?,
         "--playback" => a.playback = v()?,
+        "--tx-buffer-ms" => a.tx_buffer_ms = num(k, &v()?)?,
         "--call" => a.call = cli::call(&v()?)?,
         "--digi" => {
             a.digi = v()?.to_ascii_uppercase();
@@ -147,6 +154,7 @@ fn take(a: &mut Args, k: &str, mut v: impl FnMut() -> Result<String, String>) ->
         "--ptt-tail-ms" => a.timing.tail = Duration::from_millis(num(k, &v()?)?),
         "--ptt-max-s" => a.timing.max_on = Duration::from_secs(num(k, &v()?)?),
         "--record" => a.record = Some(PathBuf::from(v()?)),
+        "--log" => a.log = Some(PathBuf::from(v()?)),
         #[cfg(feature = "registered")]
         "--registered" => a.registered = true,
         #[cfg(not(feature = "registered"))]
@@ -209,6 +217,9 @@ fn check(a: &Args) -> Result<(), String> {
     }
     if a.drive_db > 0.0 {
         return Err("--drive-db must be <= 0".into());
+    }
+    if !(ratematch::MIN_MS..=ratematch::MAX_MS).contains(&a.tx_buffer_ms) {
+        return Err(format!("--tx-buffer-ms must be {}..{}", ratematch::MIN_MS, ratematch::MAX_MS));
     }
     match (a.radio, &a.ptt) {
         (false, Some(_)) => return Err("--ptt needs --radio".into()),
@@ -278,6 +289,10 @@ fn with_config(argv: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String
     let mut all = config_args(&path)?;
     all.extend(rest);
     Ok((Some(path), all))
+}
+
+fn tx_buffer(a: &Args) -> TxBuffer {
+    TxBuffer::ms(a.tx_buffer_ms)
 }
 
 fn lead_samples(a: &Args) -> usize {
@@ -389,6 +404,11 @@ struct Tick {
     restart: bool,
 }
 
+struct TxState {
+    forced_off: bool,
+    latency: Option<i64>,
+}
+
 struct Pumped {
     audio: std::io::Result<()>,
     ptt: std::io::Result<()>,
@@ -407,20 +427,24 @@ fn run(
     stop: &Arc<AtomicBool>,
     rec: Option<&mut Recorder>,
 ) -> std::io::Result<Outcome> {
-    let opts = Options { drive_db: a.drive_db, tx_latency: lead_samples(a) as i64 };
+    let tx = TxPath::new(a);
+    let opts = Options { drive_db: a.drive_db, tx_latency: tx.latency() };
     let host = Host::bind(&a.addr, a.port)?;
     let mode = match a.fm {
         Some(bw) => format!("FM {bw:?}"),
         None => format!("{} Hz", a.bw.hz()),
     };
-    eprintln!(
-        "xara {}: {} {mode}, cmd {} data {}, {} -> {}",
-        env!("CARGO_PKG_VERSION"),
-        a.call,
-        host.cmd_addr,
-        host.data_addr,
-        a.capture,
-        a.playback
+    xara::log::line(
+        true,
+        format_args!(
+            "xara {}: {} {mode}, cmd {} data {}, {} -> {}",
+            env!("CARGO_PKG_VERSION"),
+            a.call,
+            host.cmd_addr,
+            host.data_addr,
+            a.capture,
+            a.playback
+        ),
     );
     match a.fm {
         Some(bw) => {
@@ -431,7 +455,7 @@ fn run(
             if !a.digi.is_empty() {
                 say!("FM digipeater {}", a.digi);
             }
-            serve(a, io, Tnc::new(station, host), settings, stop, rec)
+            serve(a, io, tx, Tnc::new(station, host), settings, stop, rec)
         }
         None => {
             let mut cfg = hf::Config {
@@ -441,7 +465,7 @@ fn run(
             cfg.host.registered = a.registered;
             let mut station = station::hf::Station::new(cfg, opts);
             station.set_persistence(a.persistence);
-            serve(a, io, Tnc::new(station, host), settings, stop, rec)
+            serve(a, io, tx, Tnc::new(station, host), settings, stop, rec)
         }
     }
 }
@@ -449,6 +473,7 @@ fn run(
 fn serve<M: Modem>(
     a: &Args,
     mut io: Box<dyn Audio>,
+    tx: TxPath,
     mut tnc: Tnc<M>,
     settings: Arc<Settings>,
     stop: &Arc<AtomicBool>,
@@ -475,27 +500,111 @@ fn serve<M: Modem>(
             let ui = UiServer::bind(a.ui.addr(), p, feed, info, access)?;
             say!("UI http://{}/", ui.addr);
             if let (true, Some(t)) = (a.ui_control, token) {
-                say!("UI controls enabled at http://{}/?token={t}: Tune keys the transmitter", ui.addr);
+                xara::log::console(format_args!(
+                    "UI controls enabled at http://{}/?token={t}: Tune keys the transmitter",
+                    ui.addr
+                ));
+                xara::log::note(format_args!("UI controls enabled: Tune keys the transmitter"));
             }
             tnc.set_telemetry(t);
             Some(ui)
         }
         None => None,
     };
-    let pumped = pump(a, io.as_mut(), stop, rec, |x, out, forced| {
+    let pumped = pump(a, io.as_mut(), tx, stop, rec, |x, out, s| {
+        if let Some(t) = s.latency {
+            tnc.set_tx_latency(t);
+        }
         tnc.process(x, out);
-        tnc.force_ptt_off(forced);
+        tnc.force_ptt_off(s.forced_off);
         Tick { keyed: tnc.keyed(), tuning: tnc.station().tuning(), restart: tnc.restart_requested() }
     });
     Ok(Outcome { drive_db: tnc.station().options().drive_db, restart: tnc.restart_requested(), pumped })
 }
 
+struct TxPath {
+    delay: audio::TxAudio,
+    rate: RateMatch,
+    lead: usize,
+    prime: usize,
+    matched: Vec<f64>,
+    played: Vec<i16>,
+    last: Instant,
+    noted: Instant,
+}
+
+impl TxPath {
+    fn new(a: &Args) -> Self {
+        let (lead, buf, now) = (lead_samples(a), tx_buffer(a), Instant::now());
+        Self {
+            delay: audio::TxAudio::new(lead),
+            rate: RateMatch::new(buf),
+            lead,
+            prime: buf.target,
+            matched: Vec::new(),
+            played: Vec::new(),
+            last: now,
+            noted: now,
+        }
+    }
+
+    fn latency(&self) -> i64 {
+        (self.lead + self.rate.latency()) as i64
+    }
+
+    fn start(&mut self, io: &mut dyn Audio) -> std::io::Result<()> {
+        audio::skip_backlog(io)?;
+        io.write(&vec![0; self.prime])?;
+        (self.last, self.noted) = (Instant::now(), Instant::now());
+        Ok(())
+    }
+
+    fn send(
+        &mut self,
+        io: &mut dyn Audio,
+        out: &mut [f64],
+        forced: bool,
+        waited: Duration,
+        backlog: Option<usize>,
+    ) -> std::io::Result<Option<i64>> {
+        self.delay.process(out, forced);
+        self.rate.process(out, &mut self.matched);
+        self.played.clear();
+        self.played.extend(self.matched.iter().map(|&v| audio::quantize(v)));
+        io.write(&self.played)?;
+        let q = io.queued()?;
+        let now = Instant::now();
+        let mut latency = None;
+        for e in self.rate.steer(q, backlog, now.duration_since(self.last).saturating_sub(waited)) {
+            if let Event::Latency(_) = e {
+                latency = Some(self.latency());
+            }
+            report(e);
+        }
+        self.last = now;
+        if now.duration_since(self.noted) >= STATUS_EVERY {
+            self.noted = now;
+            let s = self.rate.status();
+            xara::log::note(format_args!(
+                "audio: TX rate {:+.0} ppm (clock {:+.0} ppm), queue {:.1} ms holding {:.1} ms, {} underruns",
+                s.ppm,
+                s.skew,
+                ms(s.fill),
+                ms(s.hold),
+                s.underruns
+            ));
+        }
+        Ok(latency)
+    }
+}
+
 fn pump(
     a: &Args,
     io: &mut dyn Audio,
+    mut tx: TxPath,
     stop: &Arc<AtomicBool>,
     mut rec: Option<&mut Recorder>,
-    mut process: impl FnMut(&[f64], &mut [f64], bool) -> Tick,
+    mut process: impl FnMut(&[f64], &mut [f64], TxState) -> Tick,
 ) -> Pumped {
     let mut ptt_result = Ok(());
     let mut ptt = match &a.ptt {
@@ -516,14 +625,22 @@ fn pump(
         }
         None => None,
     };
-    let mut tx = audio::TxAudio::new(lead_samples(a));
+    let mut behind = Behind::new();
     let (mut x, mut out) = (vec![0.0; audio::BLOCK], vec![0.0; audio::BLOCK]);
     let (mut rx, mut sent) = (vec![0i16; audio::BLOCK], vec![0i16; audio::BLOCK]);
+    let mut latency = None;
     let audio = (|| {
+        tx.start(io)?;
         while !stop.load(Ordering::SeqCst) {
+            let reading = Instant::now();
             io.read(&mut rx)?;
+            let waited = reading.elapsed();
+            let backlog = io.backlog()?;
+            behind.tick(backlog);
             x.iter_mut().zip(&rx).for_each(|(v, &s)| *v = audio::sample(s));
-            let Tick { keyed, tuning, restart } = process(&x, &mut out, ptt.as_ref().is_some_and(PttCtl::forced_off));
+            let forced_off = ptt.as_ref().is_some_and(PttCtl::forced_off);
+            let Tick { keyed, tuning, restart } =
+                process(&x, &mut out, TxState { forced_off, latency: latency.take() });
             if keyed {
                 if let Err(e) = ptt.as_mut().map_or(Ok(()), |p| p.set(true)) {
                     ptt_result = Err(e);
@@ -531,10 +648,9 @@ fn pump(
                 }
             }
             let forced = ptt.as_ref().is_some_and(PttCtl::forced_off);
-            tx.process(&mut out, forced);
-            sent.iter_mut().zip(&out).for_each(|(s, &v)| *s = audio::quantize(v));
-            io.write(&sent)?;
+            latency = tx.send(io, &mut out, forced, waited, backlog)?;
             if let Some(r) = rec.as_deref_mut() {
+                sent.iter_mut().zip(&out).for_each(|(s, &v)| *s = audio::quantize(v));
                 r.push(&rx, &sent, record::ptt(keyed, forced, tuning));
             }
             if !keyed {
@@ -558,6 +674,38 @@ fn pump(
     Pumped { audio, ptt: ptt_result }
 }
 
+fn ms(frames: f64) -> f64 {
+    frames * 1e3 / f64::from(audio::RATE)
+}
+
+fn report(e: Event) {
+    match e {
+        Event::Aligned { start, hold, target } => info!(
+            "audio: playback latency {:.0} ms at start, holding {:.0} ms for {:.0} ms of headroom",
+            ms(start),
+            ms(hold),
+            ms(target)
+        ),
+        Event::Realign(n) => {
+            info!("audio: TX queue {:+.0} ms off after a stall, realigning while silent", -ms(n as f64))
+        }
+        Event::Latency(n) => info!("audio: playback path settled at {:.0} ms", ms(n as f64)),
+        Event::Skew(ppm) => say!("audio: playback clock {ppm:+.0} ppm against capture, rate matched"),
+        Event::Pinned => say!(
+            "audio: playback and capture clocks differ by more than {:.0}%, past what rate matching covers",
+            ratematch::MAX_SKEW * 100.0
+        ),
+        Event::Headroom { hold, headroom } => {
+            let fix = match ms(headroom).ceil() as u32 {
+                n if n <= ratematch::MAX_MS => format!(" (--tx-buffer-ms {n} avoids this)"),
+                _ => String::new(),
+            };
+            say!("audio: TX queue ran dry without a stall, holding {:.0} ms from now on{fix}", ms(hold))
+        }
+        Event::NoQueue => info!("audio: the playback device reports no queue, so TX is not rate matched"),
+    }
+}
+
 fn open_audio(
     argv: &[String],
     a: Args,
@@ -565,14 +713,14 @@ fn open_audio(
     error: &mut Option<String>,
 ) -> Result<(Args, Box<dyn Audio>), std::io::Error> {
     let devices = |k: &str| k == "capture" || k == "playback";
-    match audio::open(a.audio, &a.capture, &a.playback, a.radio) {
+    match audio::open(a.audio, &a.capture, &a.playback, a.radio, tx_buffer(&a)) {
         Ok(io) => Ok((a, io)),
         Err(e) if applied.is_some_and(|s| s.iter().any(|(k, _)| devices(k))) => {
             say!("saved audio devices failed ({e}); using the command line's");
             *error = Some(format!("saved audio devices failed: {e}"));
             let rest: Pairs = applied.into_iter().flatten().filter(|(k, _)| !devices(k)).cloned().collect();
             let base = with_saved(argv, &rest, a.fm.is_some()).map_err(std::io::Error::other)?;
-            let io = audio::open(base.audio, &base.capture, &base.playback, base.radio)?;
+            let io = audio::open(base.audio, &base.capture, &base.playback, base.radio, tx_buffer(&base))?;
             Ok((base, io))
         }
         Err(e) => Err(e),
@@ -629,6 +777,9 @@ fn real_main() -> Result<ExitCode, String> {
         Err(c) => return Ok(c),
     };
     xara::log::init("xara", base.quiet);
+    if let Some(p) = &base.log {
+        xara::log::open(p).map_err(|e| format!("--log {}: {e}", p.display()))?;
+    }
     if let Some(p) = &config {
         say!("config {}", p.display());
     }
@@ -808,12 +959,33 @@ mod tests {
     }
 
     #[test]
+    fn tx_buffer_sizes_the_queue_from_the_command_line_or_a_config() {
+        let a = parse(&argv("--call N2CALL --capture c --playback p")).unwrap().unwrap();
+        assert_eq!(tx_buffer(&a), TxBuffer { target: 1920 });
+        let a = parse(&argv("--call N2CALL --capture c --playback p --tx-buffer-ms 100")).unwrap().unwrap();
+        assert_eq!((tx_buffer(&a).target, tx_buffer(&a).capacity()), (4800, 19200));
+        let p = conf("conf-tx-buffer", "tx-buffer-ms = 60\n");
+        assert_eq!(config_args(&p).unwrap(), argv("--tx-buffer-ms 60"));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn record_takes_a_path_from_the_command_line_or_a_config() {
         let a = parse(&argv("--call N2CALL --capture c --playback p --record /tmp/x.wav")).unwrap().unwrap();
         assert_eq!(a.record.as_deref(), Some(Path::new("/tmp/x.wav")));
         assert!(parse(&argv("--call N2CALL --capture c --playback p --record")).is_err());
         let p = conf("conf-record", "record = cap.flac\n");
         assert_eq!(config_args(&p).unwrap(), argv("--record cap.flac"));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn log_takes_a_path_from_the_command_line_or_a_config() {
+        let a = parse(&argv("--call N2CALL --capture c --playback p --log xara.log")).unwrap().unwrap();
+        assert_eq!(a.log.as_deref(), Some(Path::new("xara.log")));
+        assert!(parse(&argv("--call N2CALL --capture c --playback p --log")).is_err());
+        let p = conf("conf-log", "log = /var/log/xara.log\n");
+        assert_eq!(config_args(&p).unwrap(), argv("--log /var/log/xara.log"));
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 

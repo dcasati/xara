@@ -1,9 +1,10 @@
 pub mod code;
 
+use crate::dsp::sine;
 use crate::hf::level::Bandwidth;
 use crate::hf::tx;
 use crate::rnd::VbRnd;
-use std::f64::consts::{PI, SQRT_2};
+use std::f64::consts::SQRT_2;
 
 pub const SYMBOL_SAMPLES: usize = 2048;
 pub const NUM_CODES: usize = 58;
@@ -320,10 +321,8 @@ pub fn synth(lead: &[Symbol], codeword: &[Symbol]) -> Vec<f64> {
     lead.iter()
         .chain(codeword)
         .flat_map(|tones| {
-            (0..SYMBOL_SAMPLES).map(move |n| {
-                tones.iter().map(|&k| (2.0 * PI * f64::from(k) * n as f64 / SYMBOL_SAMPLES as f64).sin()).sum::<f64>()
-                    / tones.len() as f64
-            })
+            let rows: Vec<&[f64]> = tones.iter().map(|&k| sine(k, SYMBOL_SAMPLES)).collect();
+            (0..SYMBOL_SAMPLES).map(move |n| rows.iter().map(|r| r[n]).sum::<f64>() / tones.len() as f64)
         })
         .collect()
 }

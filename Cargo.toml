@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/xara-phy", "crates/xara-arq", "crates/xara-host", "crates/xara-ui", "crates/xara", "crates/xara-testkit"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 publish = false

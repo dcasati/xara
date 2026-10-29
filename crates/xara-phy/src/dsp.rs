@@ -78,7 +78,21 @@ impl Window {
 pub const CHI_MIN: f64 = 20.0;
 
 pub fn quantise(x: f64) -> f64 {
-    (x.clamp(-1.0, 1.0) * 32767.0).round_ties_even() / 32767.0
+    const ULP_ONE: f64 = 4_503_599_627_370_496.0;
+    let y = x.clamp(-1.0, 1.0) * 32767.0;
+    ((y.abs() + ULP_ONE) - ULP_ONE).copysign(y) / 32767.0
+}
+
+pub(crate) fn sine(k: u32, period: usize) -> &'static [f64] {
+    static TABLES: [[OnceLock<Vec<f64>>; 128]; 3] = [const { [const { OnceLock::new() }; 128] }; 3];
+    let p = match period {
+        512 => 0,
+        1024 => 1,
+        2048 => 2,
+        _ => panic!("no sine table for period {period}"),
+    };
+    TABLES[p][k as usize]
+        .get_or_init(|| (0..=period).map(|n| (2.0 * PI * f64::from(k) * n as f64 / period as f64).sin()).collect())
 }
 
 pub fn db_amp(db: f64) -> f64 {
@@ -191,7 +205,40 @@ pub fn kaiser_lowpass(n: usize, cutoff: f64, fs: f64, beta: f64) -> Vec<f64> {
     h.iter().map(|v| v / s).collect()
 }
 
+pub(crate) fn par_map<T: Sync, R: Send + Default>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let mut out: Vec<R> = items.iter().map(|_| R::default()).collect();
+    let per = items.len().div_ceil(cores()).max(1);
+    let f = &f;
+    std::thread::scope(|s| {
+        let mut parts = out.chunks_mut(per).zip(items.chunks(per));
+        let first = parts.next();
+        for (o, x) in parts {
+            s.spawn(move || o.iter_mut().zip(x).for_each(|(o, x)| *o = f(x)));
+        }
+        if let Some((o, x)) = first {
+            o.iter_mut().zip(x).for_each(|(o, x)| *o = f(x));
+        }
+    });
+    out
+}
+
 pub(crate) fn cores() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantise_matches_round_ties_even() {
+        let edges = [0.0, -0.0, 1e-300, -1e-300, 1.0, -1.0, 3.0, -3.0, f64::MAX, f64::MIN];
+        let grid = (-140_000..=140_000)
+            .flat_map(|i| [0.0, 1e-9, 0.25, 0.499_999_999, 0.5, 0.75].map(|f| (f64::from(i) + f) / 65_534.0));
+        for x in edges.into_iter().chain(grid).flat_map(|x| [x, -x]) {
+            let want = (x.clamp(-1.0, 1.0) * 32767.0).round_ties_even() / 32767.0;
+            assert_eq!(quantise(x).to_bits(), want.to_bits(), "{x}");
+        }
+    }
 }

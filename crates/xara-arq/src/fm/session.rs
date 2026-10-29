@@ -601,10 +601,14 @@ impl Session {
                     }
                 }
                 self.repeats += 1;
+                self.timing.miss();
                 let a = self.ack_req();
                 self.send_ctrl(a);
             }
-            State::IdleSent | State::AwaitGo => self.resend_last(),
+            State::IdleSent | State::AwaitGo => {
+                self.timing.miss();
+                self.resend_last();
+            }
             State::FqWait => {
                 self.core.host(HostEvent::Disconnected);
                 self.core.host(HostEvent::CancelPending);

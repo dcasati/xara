@@ -36,7 +36,7 @@ pub fn frame_rows(l: &Level, other: &[u16], phasors: &[Vec<Complex64>], tx: &[u8
 }
 
 pub fn synth(first: u32, rows: &[Vec<Complex64>]) -> Vec<f64> {
-    ofdm::synth(rows.iter().map(|row| ofdm::idft(first as usize, row)))
+    ofdm::synth(first as usize, rows.iter().map(Vec::as_slice), 1.0)
 }
 
 pub fn modulate(

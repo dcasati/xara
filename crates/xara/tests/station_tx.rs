@@ -33,16 +33,22 @@ fn tune_tone_level_and_ptt() {
 
 #[test]
 fn a_ptt_lead_holds_the_ptt_report_until_the_audio_is_out() {
-    let opts = Options { tx_latency: 4800, ..Options::default() };
-    let mut st = Station::new(Config::new(Bandwidth::Hz2300, "N0CALL"), opts);
-    assert!(st.tune(true));
-    assert!(run(&mut st, 4800).1.contains(&Report::Ptt(true)));
-    assert!(st.tune(false));
-    let (x, rep) = run(&mut st, 4800);
-    assert!(x.iter().all(|&v| v == 0.0));
-    assert!(!rep.contains(&Report::Ptt(false)) && st.ptt() && !st.idle());
-    assert_eq!(run(&mut st, 1).1, [Report::Ptt(false)]);
-    assert!(!st.ptt() && st.idle());
+    for (start, now) in [(4800, None), (0, Some(4800)), (1000, Some(4800))] {
+        let opts = Options { tx_latency: start, ..Options::default() };
+        let mut st = Station::new(Config::new(Bandwidth::Hz2300, "N0CALL"), opts);
+        if let Some(t) = now {
+            st.set_tx_latency(t);
+        }
+        assert_eq!(st.options().tx_latency, 4800);
+        assert!(st.tune(true));
+        assert!(run(&mut st, 4800).1.contains(&Report::Ptt(true)));
+        assert!(st.tune(false));
+        let (x, rep) = run(&mut st, 4800);
+        assert!(x.iter().all(|&v| v == 0.0));
+        assert!(!rep.contains(&Report::Ptt(false)) && st.ptt() && !st.idle());
+        assert_eq!(run(&mut st, 1).1, [Report::Ptt(false)]);
+        assert!(!st.ptt() && st.idle());
+    }
 }
 
 #[test]

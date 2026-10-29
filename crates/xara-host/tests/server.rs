@@ -92,6 +92,51 @@ fn the_top_port_has_no_room_for_the_data_port() {
 }
 
 #[test]
+fn a_dropped_host_frees_its_ports() {
+    let fds = open_fds();
+    let mut last = None;
+    for _ in 0..300 {
+        let h = Host::bind("127.0.0.1", 0).unwrap();
+        last = Some((h.cmd_addr, h.data_addr));
+    }
+    let (cmd, data) = last.unwrap();
+    let t0 = Instant::now();
+    while open_fds() > fds + 32 || [cmd, data].iter().any(|&a| std::net::TcpListener::bind(a).is_err()) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "{} fds open, {fds} before", open_fds());
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_host_dropped_with_clients_lets_go_when_they_do() {
+    let (h, _c) = command_host();
+    let d = TcpStream::connect(h.data_addr).unwrap();
+    assert!(matches!(h.input.recv_timeout(Duration::from_secs(1)), Ok(Input::Connected)));
+    let addrs = [h.cmd_addr, h.data_addr];
+    drop(h);
+    thread::sleep(Duration::from_millis(50));
+    for a in addrs {
+        assert_eq!(std::net::TcpListener::bind(a).map(drop).unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+    }
+    drop(d);
+    let t0 = Instant::now();
+    while addrs.iter().any(|&a| std::net::TcpListener::bind(a).is_err()) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "{addrs:?} still bound");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_fds() -> usize {
+    0
+}
+
+#[test]
 fn an_over_long_kiss_frame_is_dropped() {
     let mut d = Deframer::default();
     let long = [vec![FEND, 0x02], vec![0x41; 6000], vec![FEND]].concat();

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
 use std::marker::PhantomData;
@@ -10,10 +11,14 @@ use super::remaining;
 type Raw = c_void;
 type ListCb<T> = extern "C" fn(*mut Raw, *const T, c_int, *mut c_void);
 type ListFn<T> = unsafe extern "C" fn(*mut Raw, ListCb<T>, *mut c_void) -> *mut Raw;
+type NotifyCb = extern "C" fn(*mut Raw, *mut c_void);
+type SuccessCb = extern "C" fn(*mut Raw, c_int, *mut c_void);
 
 pub const S16LE: c_int = 3;
 pub const STREAM_DONT_MOVE: c_int = 0x0200;
 pub const STREAM_ADJUST_LATENCY: c_int = 0x2000;
+pub const STREAM_INTERPOLATE_TIMING: c_int = 0x0002;
+pub const STREAM_AUTO_TIMING_UPDATE: c_int = 0x0008;
 const CONTEXT_NOAUTOSPAWN: c_int = 1;
 const CONTEXT_READY: c_int = 4;
 const CONTEXT_FAILED: c_int = 5;
@@ -70,6 +75,14 @@ pub struct SinkInfo {
     proplist: *const Raw,
 }
 
+#[cfg(target_pointer_width = "64")]
+#[repr(C)]
+struct TimingInfo {
+    _timestamp: libc::timeval,
+    _synchronized_clocks: c_int,
+    sink_usec: u64,
+}
+
 #[repr(C)]
 pub struct SourceInfo {
     name: *const c_char,
@@ -112,7 +125,12 @@ unsafe extern "C" {
     fn pa_stream_get_device_name(s: *mut Raw) -> *const c_char;
     fn pa_stream_peek(s: *mut Raw, data: *mut *const c_void, nbytes: *mut usize) -> c_int;
     fn pa_stream_drop(s: *mut Raw) -> c_int;
-    fn pa_stream_writable_size(s: *mut Raw) -> usize;
+    fn pa_stream_readable_size(s: *mut Raw) -> usize;
+    fn pa_stream_get_latency(s: *mut Raw, usec: *mut u64, negative: *mut c_int) -> c_int;
+    #[cfg(target_pointer_width = "64")]
+    fn pa_stream_get_timing_info(s: *mut Raw) -> *const TimingInfo;
+    fn pa_stream_update_timing_info(s: *mut Raw, cb: Option<SuccessCb>, userdata: *mut c_void) -> *mut Raw;
+    fn pa_stream_set_underflow_callback(s: *mut Raw, cb: Option<NotifyCb>, userdata: *mut c_void);
     fn pa_stream_write(
         s: *mut Raw,
         data: *const c_void,
@@ -200,7 +218,14 @@ impl Conn {
     }
 
     pub fn iterate(&self, until: Instant, what: &str) -> io::Result<()> {
-        let left = c_int::try_from(remaining(until, what)?.as_micros()).unwrap_or(c_int::MAX);
+        self.run(c_int::try_from(remaining(until, what)?.as_micros()).unwrap_or(c_int::MAX), what)
+    }
+
+    pub fn dispatch(&self, what: &str) -> io::Result<()> {
+        self.run(0, what)
+    }
+
+    fn run(&self, left: c_int, what: &str) -> io::Result<()> {
         let ml = self.0.ml.as_ptr();
         // SAFETY: ml is live and only driven from this thread, since Conn is not Send.
         let r = unsafe {
@@ -328,8 +353,15 @@ pub enum Peek<'a> {
     Data(&'a [u8]),
 }
 
+extern "C" fn underflow(_: *mut Raw, userdata: *mut c_void) {
+    // SAFETY: userdata is the counter the Stream owns, freed only after its Drop has cleared this callback.
+    let n = unsafe { &*userdata.cast::<Cell<u64>>() };
+    n.set(n.get().wrapping_add(1));
+}
+
 pub struct Stream {
     s: NonNull<Raw>,
+    underflows: NonNull<Cell<u64>>,
     conn: Conn,
 }
 
@@ -337,7 +369,8 @@ impl Stream {
     pub fn new(conn: &Conn, name: &CStr, spec: &SampleSpec) -> Option<Self> {
         // SAFETY: ctx is live and spec outlives the call; a null map selects the default.
         let s = NonNull::new(unsafe { pa_stream_new(conn.ctx(), name.as_ptr(), spec, null()) })?;
-        Some(Self { s, conn: conn.clone() })
+        let underflows = NonNull::from(Box::leak(Box::new(Cell::new(0))));
+        Some(Self { s, underflows, conn: conn.clone() })
     }
 
     fn raw(&self) -> *mut Raw {
@@ -387,12 +420,49 @@ impl Stream {
         status(what, unsafe { pa_stream_drop(self.raw()) })
     }
 
-    pub fn writable_size(&self) -> usize {
+    pub fn readable(&self) -> Option<usize> {
         // SAFETY: the stream is live.
-        match unsafe { pa_stream_writable_size(self.raw()) } {
-            usize::MAX => 0,
-            n => n,
+        let n = unsafe { pa_stream_readable_size(self.raw()) };
+        (n != usize::MAX).then_some(n)
+    }
+
+    pub fn latency_us(&self) -> Option<u64> {
+        let (mut usec, mut negative) = (0u64, 0);
+        // SAFETY: the stream is live and both out pointers are valid.
+        let r = unsafe { pa_stream_get_latency(self.raw(), &mut usec, &mut negative) };
+        (r >= 0).then_some(if negative != 0 { 0 } else { usec })
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    pub fn sink_us(&self) -> Option<u64> {
+        // SAFETY: the stream is live; the result is null or its timing info, read before the next libpulse call.
+        let t = unsafe { pa_stream_get_timing_info(self.raw()) };
+        // SAFETY: a non-null t is valid for this read.
+        (!t.is_null()).then(|| unsafe { (*t).sink_usec })
+    }
+
+    #[cfg(not(target_pointer_width = "64"))]
+    pub fn sink_us(&self) -> Option<u64> {
+        None
+    }
+
+    pub fn request_timing(&self) {
+        // SAFETY: the stream is live and no callback is given, so nothing of ours is lent to the operation.
+        let op = unsafe { pa_stream_update_timing_info(self.raw(), None, null_mut()) };
+        if !op.is_null() {
+            // SAFETY: op is the reference just returned; releasing it leaves the request running.
+            unsafe { pa_operation_unref(op) };
         }
+    }
+
+    pub fn count_underflows(&mut self) {
+        // SAFETY: the stream is live and the counter outlives the registration, as Drop clears it first.
+        unsafe { pa_stream_set_underflow_callback(self.raw(), Some(underflow), self.underflows.as_ptr().cast()) };
+    }
+
+    pub fn underflows(&self) -> u64 {
+        // SAFETY: the counter lives until Drop and the callback only runs inside Conn's mainloop, not during this read.
+        unsafe { self.underflows.as_ref().get() }
     }
 
     pub fn write(&mut self, b: &[u8], what: &str) -> io::Result<()> {
@@ -403,10 +473,12 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // SAFETY: the stream is owned by self and its context is kept alive by self.conn.
+        // SAFETY: self owns the stream and leaked counter, self.conn keeps the context, and the callback goes first.
         unsafe {
+            pa_stream_set_underflow_callback(self.raw(), None, null_mut());
             pa_stream_disconnect(self.raw());
             pa_stream_unref(self.raw());
+            drop(Box::from_raw(self.underflows.as_ptr()));
         }
     }
 }

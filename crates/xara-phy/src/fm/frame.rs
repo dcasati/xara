@@ -1,4 +1,5 @@
 use super::level::Record;
+use crate::call::{ssid_code, with_ssid};
 use crate::crc::{crc_ok, crc16_genibus};
 use crate::hf::frame::TERMINATOR;
 
@@ -152,17 +153,6 @@ pub struct Record0 {
     pub chain_snr: u8,
 }
 
-fn ssid_code(call: &str) -> Option<u8> {
-    let Some((_, s)) = call.split_once('-') else { return Some(0) };
-    Some(match s {
-        "T" => 0x10,
-        "R" => 0x11,
-        "X" => 0x12,
-        "L" => 0x13,
-        _ => s.parse().ok()?,
-    })
-}
-
 fn call_field(call: &str) -> Option<[u8; 8]> {
     let base = call.split('-').next().unwrap_or("").to_ascii_uppercase();
     if base.len() > 7 || !base.is_ascii() {
@@ -170,7 +160,7 @@ fn call_field(call: &str) -> Option<[u8; 8]> {
     }
     let mut f = [b' '; 8];
     f[..base.len()].copy_from_slice(base.as_bytes());
-    f[7] = ssid_code(call)?;
+    f[7] = call.split_once('-').map_or(Some(0), |(_, s)| ssid_code(s))?;
     Some(f)
 }
 
@@ -179,14 +169,7 @@ fn parse_call(f: &[u8]) -> String {
         return String::new();
     }
     let base: String = f[..7].iter().map(|&b| b as char).collect::<String>().trim_end().to_string();
-    match f[7] {
-        0 => base,
-        0x10 => base + "-T",
-        0x11 => base + "-R",
-        0x12 => base + "-X",
-        0x13 => base + "-L",
-        n => format!("{base}-{n}"),
-    }
+    with_ssid(base, f[7])
 }
 
 pub fn snr_byte(snr_db: f64) -> u8 {

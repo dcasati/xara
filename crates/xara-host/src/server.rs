@@ -1,8 +1,9 @@
 use crate::command::{Command, parse};
 use crate::writer::Writer;
 use std::io::{self, Read};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -12,6 +13,7 @@ pub const MAX_LINE: usize = 1024;
 pub const DATA_CHUNK: usize = 65536;
 pub const INPUT_QUEUE: usize = 64;
 pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+const WAKE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub enum Input {
@@ -66,6 +68,7 @@ pub struct Host {
     pub input: Receiver<Input>,
     clients: Shared,
     hold: Arc<Hold>,
+    closed: Arc<AtomicBool>,
     pub cmd_addr: SocketAddr,
     pub data_addr: SocketAddr,
 }
@@ -81,15 +84,17 @@ impl Host {
         let (tx, input) = sync_channel(INPUT_QUEUE);
         let clients = Shared::default();
         let hold = Arc::<Hold>::default();
+        let closed = Arc::<AtomicBool>::default();
         let h = Self {
             input,
             clients: clients.clone(),
             hold: hold.clone(),
+            closed: closed.clone(),
             cmd_addr: cl.local_addr()?,
             data_addr: dl.local_addr()?,
         };
-        serve(cl, Port::Cmd, clients.clone(), tx.clone(), hold.clone())?;
-        serve(dl, Port::Data, clients, tx, hold)?;
+        serve(cl, Port::Cmd, clients.clone(), tx.clone(), hold.clone(), closed.clone())?;
+        serve(dl, Port::Data, clients, tx, hold, closed)?;
         Ok(h)
     }
 
@@ -123,7 +128,20 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.hold.set(false);
+        self.closed.store(true, Ordering::SeqCst);
+        wake(self.cmd_addr);
+        wake(self.data_addr);
     }
+}
+
+fn wake(mut a: SocketAddr) {
+    if a.ip().is_unspecified() {
+        a.set_ip(match a.ip() {
+            IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+            IpAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    let _ = TcpStream::connect_timeout(&a, WAKE_TIMEOUT);
 }
 
 fn set_reuse(l: &TcpListener, on: bool) -> io::Result<()> {
@@ -167,13 +185,21 @@ fn bind_fixed(addr: &str, port: u16) -> io::Result<TcpListener> {
     Err(io::Error::new(io::ErrorKind::AddrInUse, "no free port"))
 }
 
-fn serve(l: TcpListener, port: Port, clients: Shared, tx: SyncSender<Input>, hold: Arc<Hold>) -> io::Result<()> {
+fn serve(
+    l: TcpListener,
+    port: Port,
+    clients: Shared,
+    tx: SyncSender<Input>,
+    hold: Arc<Hold>,
+    closed: Arc<AtomicBool>,
+) -> io::Result<()> {
     let name = match port {
         Port::Cmd => "host-cmd-accept",
         Port::Data => "host-data-accept",
     };
+    let closed = move || closed.load(Ordering::SeqCst);
     thread::Builder::new().name(name.into()).spawn(move || {
-        loop {
+        while !closed() {
             let s = match l.accept() {
                 Ok((s, _)) => s,
                 Err(_) => {
@@ -181,15 +207,18 @@ fn serve(l: TcpListener, port: Port, clients: Shared, tx: SyncSender<Input>, hol
                     continue;
                 }
             };
-            if let Err(e) = pause(&l) {
-                eprintln!("xara: {name} cannot refuse a second client: {e}");
+            if closed() {
+                return;
             }
-            if attach(s, port, &clients, &tx, &hold).is_err() {
+            if let Err(e) = pause(&l) {
+                crate::say(format_args!("{name} cannot refuse a second client: {e}"));
+            }
+            if attach(s, port, &clients, &tx, &hold).is_err() || closed() {
                 return;
             }
             if let Err(e) = resume(&l) {
-                eprintln!("xara: {name} cannot listen again, retrying: {e}");
-                while resume(&l).is_err() {
+                crate::say(format_args!("{name} cannot listen again, retrying: {e}"));
+                while !closed() && resume(&l).is_err() {
                     thread::sleep(ACCEPT_BACKOFF);
                 }
             }

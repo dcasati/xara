@@ -44,7 +44,7 @@ impl Writer {
         if q > 0 && q + b.len() > QUEUE_BYTES {
             if !self.overflowed.swap(true, Ordering::Relaxed) {
                 let peer = self.s.peer_addr().map_or_else(|_| "client".into(), |a| a.to_string());
-                eprintln!("xara: {peer} is {q} bytes behind; closing it");
+                crate::say(format_args!("{peer} is {q} bytes behind; closing it"));
             }
             self.close();
             return false;
