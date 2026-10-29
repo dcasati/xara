@@ -212,8 +212,8 @@ fn serve(
 ) -> io::Result<UiServer> {
     let l = TcpListener::bind((addr, port))?;
     let local = l.local_addr()?;
-    if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        access.hosts.push(h.trim().to_string());
+    if let Some(h) = hostname() {
+        access.hosts.push(h);
     }
     let cookie = format!("xara_token_{}", local.port());
     let open = [Arc::default(), Arc::default()];
@@ -222,6 +222,17 @@ fn serve(
     thread::Builder::new().name("ui-hub".into()).spawn(move || hub(src, controls, info, rx))?;
     thread::Builder::new().name("ui-accept".into()).spawn(move || accept(l, tx, ctx))?;
     Ok(UiServer { addr: local })
+}
+
+fn hostname() -> Option<String> {
+    let mut b = [0u8; 256];
+    // SAFETY: b is valid for its length; gethostname writes at most that many bytes.
+    if unsafe { libc::gethostname(b.as_mut_ptr().cast(), b.len()) } != 0 {
+        return None;
+    }
+    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    let h = std::str::from_utf8(&b[..n]).ok()?.trim();
+    (!h.is_empty()).then(|| h.to_string())
 }
 
 pub fn new_token() -> io::Result<String> {

@@ -159,6 +159,7 @@ version = "0.1.2"
 name = "xara-ui"
 version = "0.1.2"
 dependencies = [
+ "libc",
  "rustfft",
  "xara-arq",
  "xara-host",

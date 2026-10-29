@@ -78,6 +78,11 @@ impl Ptt for Vox {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type Ioctl = libc::Ioctl;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type Ioctl = libc::c_ulong;
+
 pub struct Serial {
     f: File,
     path: String,
@@ -95,7 +100,7 @@ impl Serial {
         Ok(s)
     }
 
-    fn modem(&self, req: libc::Ioctl, bits: libc::c_int) -> io::Result<()> {
+    fn modem(&self, req: Ioctl, bits: libc::c_int) -> io::Result<()> {
         if unsafe { libc::ioctl(self.f.as_raw_fd(), req, &bits) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -136,6 +141,7 @@ pub fn cm108_report(gpio: u8, on: bool) -> [u8; 5] {
     [0, 0, if on { m } else { 0 }, m, 0]
 }
 
+#[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
 pub fn is_hidraw(path: &str) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let Ok(m) = std::fs::metadata(path) else { return false };
@@ -145,6 +151,21 @@ pub fn is_hidraw(path: &str) -> bool {
     let (major, minor) = (libc::major(m.rdev()), libc::minor(m.rdev()));
     std::fs::read_link(format!("/sys/dev/char/{major}:{minor}/subsystem"))
         .is_ok_and(|l| l.file_name().is_some_and(|n| n == "hidraw"))
+}
+
+// FreeBSD's hidraw(4) speaks the Linux hidraw protocol; uhid(4) does not, so only accept hidraw.
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+pub fn is_hidraw(path: &str) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(m) = std::fs::metadata(path) else { return false };
+    if !m.file_type().is_char_device() {
+        return false;
+    }
+    let mut buf = [0 as libc::c_char; 64];
+    // SAFETY: buf is valid for its length and devname_r NUL-terminates on success.
+    let p =
+        unsafe { libc::devname_r(m.rdev() as libc::dev_t, libc::S_IFCHR, buf.as_mut_ptr(), buf.len() as libc::c_int) };
+    !p.is_null() && unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().starts_with(b"hidraw")
 }
 
 impl Cm108 {

@@ -1,6 +1,6 @@
 # xara
 
-a VARA-compatible modem for linux. tested against VARA HF 4.9.0 and FM 4.4.0.
+a VARA-compatible modem for linux and freebsd. tested against VARA HF 4.9.0 and FM 4.4.0.
 
 ## minimum config
 
@@ -34,6 +34,26 @@ alternatively for a local setup you can do:
 
     cargo build --release
     cargo test
+
+on freebsd, install deps and build the same way:
+
+    pkg install rust pkgconf alsa-lib alsa-plugins pulseaudio
+    cargo build --release
+
+alsa on freebsd goes through alsa-plugins (OSS). for radio playback, define a
+PCM that pins a numbered unit (`/dev/dspN`, see `cat /dev/sndstat`) in
+`~/.asoundrc`; plain `/dev/dsp` follows the default unit and is refused:
+
+    pcm.digirig {
+        type plug
+        slave.pcm { type oss device "/dev/dsp5" }
+    }
+
+then use `--capture digirig --playback digirig`. for `--ptt cm108` use a
+`/dev/hidrawN` device (load
+`hidraw` and set `hw.usb.usbhid.enable=1`); `/dev/uhidN` will not work. serial
+PTT uses the `/dev/cuaU*` call-out devices. the systemd and udev files in
+`dist/` are linux-only.
 
 ## options
 

@@ -7,10 +7,15 @@ use std::thread;
 
 static PIPE: AtomicI32 = AtomicI32::new(-1);
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use libc::__errno_location as errno_location;
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+use libc::__error as errno_location;
+
 extern "C" fn deliver(_: libc::c_int) {
     // SAFETY: errno is thread-local and restored before returning; write is async-signal-safe.
     unsafe {
-        let errno = libc::__errno_location();
+        let errno = errno_location();
         let saved = *errno;
         libc::write(PIPE.load(Ordering::Relaxed), [0u8].as_ptr().cast(), 1);
         *errno = saved;

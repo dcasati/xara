@@ -56,9 +56,18 @@ impl Drop for Scratch {
 #[test]
 fn serial_refuses_non_serial_devices() {
     assert!(Serial::open("/dev/null", libc::TIOCM_RTS).is_err());
+}
+
+// FreeBSD ptys accept the modem-line ioctls, so only Linux rejects them.
+#[cfg(target_os = "linux")]
+#[test]
+fn serial_refuses_ptys() {
     let (mut m, mut s) = (0, 0);
     let mut name = [0 as libc::c_char; 64];
-    assert_eq!(unsafe { libc::openpty(&mut m, &mut s, name.as_mut_ptr(), std::ptr::null(), std::ptr::null()) }, 0);
+    assert_eq!(
+        unsafe { libc::openpty(&mut m, &mut s, name.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut()) },
+        0
+    );
     let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_str().unwrap().to_string();
     let e = Serial::open(&path, libc::TIOCM_RTS).err().expect("a pty has no modem lines");
     assert_eq!(e.raw_os_error(), Some(libc::ENOTTY));

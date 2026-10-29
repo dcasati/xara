@@ -1,5 +1,9 @@
 # Changelog
 
+## unreleased
+
+- builds and runs on FreeBSD (xara and xara-monitor)
+
 ## 0.1.2
 
 - `--log` produces timestamped log files

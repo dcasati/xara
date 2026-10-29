@@ -19,6 +19,12 @@ const WALK_DEPTH: usize = 64;
 const REPORT: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(50);
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ESTRPIPE: c_int = libc::ESTRPIPE;
+// alsa-lib's <alsa/pcm.h> falls back to EPIPE where the OS has no ESTRPIPE.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const ESTRPIPE: c_int = libc::EPIPE;
+
 const SERVERS: [&str; 4] = ["default", "pulse", "pipewire", "jack"];
 const NEED_CARD: [&str; 4] = ["hw", "plughw", "dmix", "dshare"];
 const PASS: [&str; 18] = [
@@ -46,12 +52,22 @@ const PASS: [&str; 18] = [
 enum Def {
     Name(String),
     Plugin { kind: String, slave: Option<Box<Def>> },
+    Oss(Option<String>),
+}
+
+// /dev/dsp follows hw.snd.default_unit; only a numbered unit is a fixed card.
+fn oss_unit(dev: &str) -> bool {
+    dev.strip_prefix("/dev/dsp").is_some_and(|u| {
+        let (unit, sub) = u.split_once('.').unwrap_or((u, "0"));
+        [unit, sub].iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
     Card,
     Null,
+    Oss,
 }
 
 fn name_problem(name: &str) -> Option<String> {
@@ -87,6 +103,12 @@ fn follow(
         }
         Def::Plugin { kind, .. } if kind == "hw" => Ok(Route::Card),
         Def::Plugin { kind, .. } if kind == "null" => Ok(Route::Null),
+        Def::Oss(Some(d)) if oss_unit(d) => Ok(Route::Oss),
+        Def::Oss(d) => Err(format!(
+            "refusing ALSA playback to {top:?}: its oss plugin uses {:?}, which follows the default unit; \
+             set device to a numbered unit (/dev/dspN)",
+            d.as_deref().unwrap_or("/dev/dsp")
+        )),
         Def::Plugin { kind, slave: Some(s) } if PASS.contains(&kind.as_str()) => follow(lookup, s, top, depth + 1),
         Def::Plugin { kind, .. } => Err(format!(
             "refusing ALSA playback to {top:?}: it goes through a {kind:?} plugin; only ALSA's own plugins \
@@ -217,6 +239,9 @@ impl Config {
             return Ok(Def::Name(s));
         }
         let kind = n.child("type").and_then(Cfg::string).ok_or_else(|| format!("ALSA PCM {at:?} has no type"))?;
+        if kind == "oss" {
+            return Ok(Def::Oss(n.child("device").and_then(Cfg::string)));
+        }
         let key = if kind == "asym" { "playback" } else { "slave" };
         let slave = match n.child(key) {
             Some(s) if PASS.contains(&kind.as_str()) => Some(Box::new(self.slave(s, at)?)),
@@ -651,7 +676,7 @@ impl Pcm {
         if self.reported.is_none_or(|t| t.elapsed() >= REPORT) {
             self.reported = Some(Instant::now());
             let kind = match (err.errno, self.dir) {
-                (libc::ESTRPIPE, _) => "suspended",
+                (e, _) if ESTRPIPE != libc::EPIPE && e == ESTRPIPE => "suspended",
                 (_, Direction::Playback) => "underrun",
                 _ => "overrun",
             };
@@ -667,7 +692,7 @@ impl Pcm {
         }
         let errno = match self.pcm.state() {
             sys::SND_PCM_STATE_XRUN => libc::EPIPE,
-            sys::SND_PCM_STATE_SUSPENDED => libc::ESTRPIPE,
+            sys::SND_PCM_STATE_SUSPENDED => ESTRPIPE,
             sys::SND_PCM_STATE_DISCONNECTED => libc::ENODEV,
             _ => return Ok(()),
         };
@@ -721,7 +746,8 @@ impl AlsaIo {
         let route = cfg.resolve_playback(playback, radio)?;
         let mut play = Pcm::open(&cfg, playback, Direction::Playback)?;
         let card = play.card()?;
-        if (route == Route::Card) != (card >= 0) {
+        // ALSA reports no card (-1) for the oss plugin, so there is nothing to cross-check.
+        if route != Route::Oss && (route == Route::Card) != (card >= 0) {
             return Err(io::Error::other(format!(
                 "refusing ALSA playback to {playback:?}: its configuration says {route:?} but ALSA opened card {card}"
             )));
@@ -845,6 +871,11 @@ mod tests {
             ("multi", plugin("multi", None)),
             ("dangling", plugin("plug", None)),
             ("loop", name("loop")),
+            ("oss_unit", plugin("plug", Some(Def::Oss(Some("/dev/dsp5".into()))))),
+            ("oss_sub", Def::Oss(Some("/dev/dsp5.0".into()))),
+            ("oss_default", plugin("plug", Some(Def::Oss(None)))),
+            ("oss_bare", Def::Oss(Some("/dev/dsp".into()))),
+            ("oss_odd", Def::Oss(Some("/dev/dsp5x".into()))),
         ])
     }
 
@@ -893,6 +924,18 @@ mod tests {
         for n in ["hw", "plughw", "dmix", "dshare"] {
             assert!(check(n, true).unwrap_err().contains("default card"), "{n}");
         }
+    }
+
+    #[test]
+    fn radio_allows_oss_only_on_a_numbered_unit() {
+        for n in ["oss_unit", "oss_sub"] {
+            assert_eq!(check(n, true), Ok(Route::Oss), "{n}");
+        }
+        for n in ["oss_default", "oss_bare", "oss_odd"] {
+            assert!(check(n, true).unwrap_err().contains("numbered unit"), "{n}");
+            assert!(check(n, false).is_err(), "{n}");
+        }
+        assert!(check("oss_unit", false).unwrap_err().contains("needs --radio"));
     }
 
     #[test]

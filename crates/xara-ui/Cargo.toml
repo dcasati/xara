@@ -12,6 +12,7 @@ description = "Telemetry feed and web UI server (HTTP, WebSocket, NDJSON) for th
 [dependencies]
 xara-arq.workspace = true
 xara-host.workspace = true
+libc.workspace = true
 rustfft.workspace = true
 
 [dev-dependencies]

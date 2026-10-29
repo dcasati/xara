@@ -144,32 +144,98 @@ fn wake(mut a: SocketAddr) {
     let _ = TcpStream::connect_timeout(&a, WAKE_TIMEOUT);
 }
 
-fn set_reuse(l: &TcpListener, on: bool) -> io::Result<()> {
+fn set_opt(s: &impl AsRawFd, opt: libc::c_int, on: bool) -> io::Result<()> {
     let v: libc::c_int = on.into();
     let len = std::mem::size_of_val(&v) as libc::socklen_t;
-    let r =
-        unsafe { libc::setsockopt(l.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, (&raw const v).cast(), len) };
+    let r = unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, opt, (&raw const v).cast(), len) };
     if r != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-fn pause(l: &TcpListener) -> io::Result<()> {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn pause(l: &TcpListener, _: SocketAddr) -> io::Result<()> {
     if unsafe { libc::shutdown(l.as_raw_fd(), libc::SHUT_RD) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    set_reuse(l, false)
+    set_opt(l, libc::SO_REUSEADDR, false)
 }
 
-fn resume(l: &TcpListener) -> io::Result<()> {
-    set_reuse(l, true)?;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn resume(l: &TcpListener, _: SocketAddr) -> io::Result<()> {
+    set_opt(l, libc::SO_REUSEADDR, true)?;
     if unsafe { libc::listen(l.as_raw_fd(), 128) } != 0 {
         let e = io::Error::last_os_error();
-        let _ = set_reuse(l, false);
+        let _ = set_opt(l, libc::SO_REUSEADDR, false);
         return Err(e);
     }
     Ok(())
+}
+
+// Elsewhere shutdown() on a listening socket fails, so keep the port reserved by binding an
+// idle twin (via SO_REUSEPORT) and swapping it onto the listener's fd, which closes the
+// listener and refuses new connections. Listening on the twin resumes service.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn pause(l: &TcpListener, addr: SocketAddr) -> io::Result<()> {
+    set_opt(l, libc::SO_REUSEPORT, true)?;
+    let r = twin(addr).and_then(|t| {
+        let fd = l.as_raw_fd();
+        if unsafe { libc::dup2(t.as_raw_fd(), fd) } < 0
+            || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    });
+    let _ = set_opt(l, libc::SO_REUSEPORT, false);
+    r
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn resume(l: &TcpListener, _: SocketAddr) -> io::Result<()> {
+    if unsafe { libc::listen(l.as_raw_fd(), 128) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn twin(addr: SocketAddr) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let s = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_opt(&s, libc::SO_REUSEADDR, true)?;
+    set_opt(&s, libc::SO_REUSEPORT, true)?;
+    let r = match addr {
+        SocketAddr::V4(a) => {
+            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sa.sin_len = size_of::<libc::sockaddr_in>() as u8;
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = a.port().to_be();
+            sa.sin_addr.s_addr = u32::from(*a.ip()).to_be();
+            unsafe { libc::bind(fd, (&raw const sa).cast(), size_of_val(&sa) as libc::socklen_t) }
+        }
+        SocketAddr::V6(a) => {
+            let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sa.sin6_len = size_of::<libc::sockaddr_in6>() as u8;
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = a.port().to_be();
+            sa.sin6_flowinfo = a.flowinfo();
+            sa.sin6_addr.s6_addr = a.ip().octets();
+            sa.sin6_scope_id = a.scope_id();
+            unsafe { libc::bind(fd, (&raw const sa).cast(), size_of_val(&sa) as libc::socklen_t) }
+        }
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    set_opt(&s, libc::SO_REUSEPORT, false)?;
+    Ok(s)
 }
 
 fn bind_fixed(addr: &str, port: u16) -> io::Result<TcpListener> {
@@ -198,6 +264,7 @@ fn serve(
         Port::Data => "host-data-accept",
     };
     let closed = move || closed.load(Ordering::SeqCst);
+    let addr = l.local_addr()?;
     thread::Builder::new().name(name.into()).spawn(move || {
         while !closed() {
             let s = match l.accept() {
@@ -210,15 +277,15 @@ fn serve(
             if closed() {
                 return;
             }
-            if let Err(e) = pause(&l) {
+            if let Err(e) = pause(&l, addr) {
                 crate::say(format_args!("{name} cannot refuse a second client: {e}"));
             }
             if attach(s, port, &clients, &tx, &hold).is_err() || closed() {
                 return;
             }
-            if let Err(e) = resume(&l) {
+            if let Err(e) = resume(&l, addr) {
                 crate::say(format_args!("{name} cannot listen again, retrying: {e}"));
-                while !closed() && resume(&l).is_err() {
+                while !closed() && resume(&l, addr).is_err() {
                     thread::sleep(ACCEPT_BACKOFF);
                 }
             }
